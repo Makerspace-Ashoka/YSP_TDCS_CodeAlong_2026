@@ -1,0 +1,13 @@
+{
+  "files.autoSave": "onFocusChange",
+  "editor.formatOnSave": false,
+  "editor.fontSize": 15,
+  "git.enabled": false,
+  "git.autorefresh": false,
+  "git.confirmSync": false,
+  "platformio-ide.useBuiltinPIOCore": false,
+  "platformio-ide.activateProjectOnTextEditorChanged": true,
+  "terminal.integrated.defaultProfile.windows": "PowerShell",
+  "terminal.integrated.defaultProfile.osx": "zsh",
+  "terminal.integrated.defaultProfile.linux": "bash"
+}
