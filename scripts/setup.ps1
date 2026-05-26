@@ -490,11 +490,11 @@ function Discover-Mirror {
     if ($self) {
         $subnet = ($self -split '\.')[0..2] -join '.'
         $candidates = @(1,2,3,4,5,250,251,252,253,254) | ForEach-Object { "$subnet.$_" } | Where-Object { $_ -ne $self }
-        foreach ($host in $candidates) {
+        foreach ($candidate in $candidates) {
             try {
-                $r = Invoke-WebRequest -Uri "http://$host`:$($Script:MirrorPort)/ping" -UseBasicParsing -TimeoutSec 1
+                $r = Invoke-WebRequest -Uri "http://$candidate`:$($Script:MirrorPort)/ping" -UseBasicParsing -TimeoutSec 1
                 if ($r.StatusCode -eq 200) {
-                    $Script:MirrorBase = "http://$host`:$($Script:MirrorPort)"
+                    $Script:MirrorBase = "http://$candidate`:$($Script:MirrorPort)"
                     if (Cache-MirrorManifest) {
                         Write-Status OK "Local mirror found at $($Script:MirrorBase)"
                         return
