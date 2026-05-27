@@ -1433,23 +1433,18 @@ function Open-VsCode-IfSafe {
 
     Configure-VsCodeUserSettings
 
-    $workspaceFile = Join-Path $Script:Workspace 'ronnie-robot.code-workspace'
-
-    if (Test-Path $workspaceFile) {
-        $codeArgs = @($workspaceFile)
-        if ($Script:Mode -eq 'first_run') { $codeArgs += (Join-Path $Script:Workspace 'QUICKSTART.md') }
-        $codeFile = Join-Path $Script:StudentCodeDir 'main.cpp'
-        if (Test-Path $codeFile) { $codeArgs += $codeFile }
-        try {
-            & code @codeArgs
-            Write-Status OK 'Opened RonnieRobot workspace'
-        } catch {
-            Write-Status WARN "VS Code did not open: $_"
-        }
-    } else {
-        Write-Status WARN 'No workspace file — opening workspace folder'
-        try { & code $Script:Workspace }
-        catch { Write-Status WARN "VS Code did not open: $_" }
+    # Open as a single-root folder so PIO's workspaceContains:platformio.ini
+    # activation fires correctly and the bottom toolbar auto-appears.
+    # (.code-workspace / multi-root mode prevents PIO from auto-activating.)
+    $codeArgs = @($Script:Workspace)
+    if ($Script:Mode -eq 'first_run') { $codeArgs += (Join-Path $Script:Workspace 'QUICKSTART.md') }
+    $codeFile = Join-Path $Script:StudentCodeDir 'main.cpp'
+    if (Test-Path $codeFile) { $codeArgs += $codeFile }
+    try {
+        & code @codeArgs
+        Write-Status OK 'Opened workspace'
+    } catch {
+        Write-Status WARN "VS Code did not open: $_"
     }
 }
 
