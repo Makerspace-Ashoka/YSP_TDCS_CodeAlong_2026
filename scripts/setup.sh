@@ -784,17 +784,15 @@ ensure_vscode() {
 }
 
 _install_vscode_mac() {
-    local dmg="$STATE_DIR/VSCode.dmg"
+    local zip="$STATE_DIR/VSCode.zip"
     local internet="https://update.code.visualstudio.com/latest/darwin-universal/stable"
     status INSTALL "Downloading VS Code"
-    fetch_artifact vscode "VSCode-darwin-universal.dmg" "$internet" "$dmg" \
+    fetch_artifact vscode "VSCode-darwin-universal.zip" "$internet" "$zip" \
         || { status FAIL "VS Code download failed"; return 1; }
-    local mnt; mnt=$(hdiutil attach "$dmg" -nobrowse -quiet | awk '/Apple_HFS|\/Volumes/{print $NF; exit}')
-    [[ -n "$mnt" && -d "$mnt" ]] || { status FAIL "VS Code DMG mount failed"; return 1; }
     rm -rf "/Applications/Visual Studio Code.app"
-    cp -R "$mnt/Visual Studio Code.app" "/Applications/" \
-        || { hdiutil detach "$mnt" -quiet || true; status FAIL "VS Code copy to /Applications failed (try Terminal with Full Disk Access)"; return 1; }
-    hdiutil detach "$mnt" -quiet || true
+    run_cmd "unzip VSCode" -- unzip -q -o "$zip" -d /Applications/ \
+        || { status FAIL "VS Code unzip to /Applications failed (check disk space and admin access)"; return 1; }
+    rm -f "$zip"
     _ensure_code_symlink_mac
     code --version >/dev/null 2>&1 || { status FAIL "VS Code not runnable after install"; return 1; }
     status OK "VS Code installed"
