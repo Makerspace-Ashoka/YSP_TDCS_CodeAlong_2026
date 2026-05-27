@@ -460,14 +460,18 @@ ensure_xcode_clt() {
     status OK "Xcode Command Line Tools installed"
 }
 
-run_bootstrap_checks() {
+run_local_bootstrap_checks() {
+    # Fast, offline — always run before mode detection.
     detect_os
     check_disk_space
-    check_clock_skew
     check_write_access
     ensure_xcode_clt
+}
+
+run_network_bootstrap_checks() {
+    # Slow — clock probe and HTTPS check. Skip on daily (environment already healthy).
+    check_clock_skew
     check_https_reachable
-    discover_mirror
 }
 
 # =============================================================================
@@ -1174,6 +1178,7 @@ run_setup_mode() {
     case "$1" in
         first_run)
             status INFO "First run — installing everything (10–15 minutes)"
+            discover_mirror
             ensure_uv
             ensure_python
             ensure_upstream
@@ -1192,7 +1197,6 @@ run_setup_mode() {
             ensure_upstream
             sync_workspace
             seed_student_code_if_empty
-            run_all_health_checks || true
             print_port_guidance
             ;;
         repair)
@@ -1264,6 +1268,33 @@ write_final_summary() {
     printf '\n  Full log saved to %s\n' "$WORKSPACE_LOG"
 }
 
+configure_vscode_user_settings() {
+    # Disable workspace trust prompts (controlled lab) and point PIO extension at
+    # our venv so it works regardless of how VS Code was opened.
+    local user_dir
+    case "$OS" in
+        mac)   user_dir="$HOME/Library/Application Support/Code/User" ;;
+        linux) user_dir="$HOME/.config/Code/User" ;;
+        *)     return 0 ;;
+    esac
+    [[ -d "$user_dir" ]] || return 0
+    local f="$user_dir/settings.json"
+    local venv_bin="$VENV_DIR/bin"
+    "$PYTHON_BIN" -c "
+import json, sys
+f, venv_bin = sys.argv[1], sys.argv[2]
+try:
+    with open(f) as fh:
+        obj = json.load(fh)
+except Exception:
+    obj = {}
+obj['security.workspace.trust.enabled'] = False
+obj['platformio-ide.customPATH'] = venv_bin
+with open(f, 'w') as fh:
+    json.dump(obj, fh, indent=2)
+" "$f" "$venv_bin" 2>/dev/null || true
+}
+
 open_vscode_if_safe() {
     [[ -d "$WORKSPACE" && -d "$STUDENT_CODE_DIR" ]] || { status WARN "Skipping VS Code — workspace incomplete"; return; }
     command -v code >/dev/null 2>&1 || { status WARN "code CLI not found; run manually: code $WORKSPACE"; return; }
@@ -1272,21 +1303,18 @@ open_vscode_if_safe() {
         return
     fi
 
-    local workspace_file="$WORKSPACE/ronnie-robot.code-workspace"
+    configure_vscode_user_settings
 
-    if [[ -f "$workspace_file" ]]; then
-        local -a code_args=("$workspace_file")
-        [[ "$MODE" == "first_run" ]] && code_args+=("$WORKSPACE/QUICKSTART.md")
-        [[ -f "$STUDENT_CODE_DIR/main.cpp" ]] && code_args+=("$STUDENT_CODE_DIR/main.cpp")
-        if code "${code_args[@]}" 2>/dev/null; then
-            status OK "Opened RonnieRobot workspace"
-        else
-            status WARN "VS Code did not open — run manually: code $workspace_file"
-        fi
+    # Open as single-root folder so PIO's workspaceContains:platformio.ini
+    # activation fires correctly. (.code-workspace multi-root mode prevents PIO
+    # from auto-activating and showing the bottom toolbar.)
+    local -a code_args=("$WORKSPACE")
+    [[ "$MODE" == "first_run" ]] && code_args+=("$WORKSPACE/QUICKSTART.md")
+    [[ -f "$STUDENT_CODE_DIR/main.cpp" ]] && code_args+=("$STUDENT_CODE_DIR/main.cpp")
+    if code "${code_args[@]}" 2>/dev/null; then
+        status OK "Opened workspace"
     else
-        status WARN "No workspace file — opening workspace folder"
-        code "$WORKSPACE" 2>/dev/null \
-            || status WARN "VS Code did not open — run manually: code $WORKSPACE"
+        status WARN "VS Code did not open — run manually: code $WORKSPACE"
     fi
 }
 
@@ -1298,9 +1326,11 @@ main() {
     init_console
     start_setup_log
     migrate_workspace_if_needed
-    run_bootstrap_checks
+    run_local_bootstrap_checks
     MODE=$(detect_setup_mode)
     log "Detected mode: $MODE"
+    # Network checks (clock, HTTPS) only when something needs downloading/repairing.
+    [[ "$MODE" != "daily" ]] && run_network_bootstrap_checks
     run_setup_mode "$MODE"
     write_final_summary
     open_vscode_if_safe
