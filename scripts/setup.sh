@@ -1027,7 +1027,14 @@ check_extensions()     {
 check_uv()             { refresh_path; command -v uv >/dev/null 2>&1 && uv --version >/dev/null 2>&1; }
 check_python()         { [[ -x "$PYTHON_BIN" ]] && "$PYTHON_BIN" --version 2>&1 | grep -q "Python ${PYTHON_VERSION}\."; }
 check_pio_venv()       { [[ -x "$PIO_BIN" ]] && ( cd "$WORKSPACE" 2>/dev/null && "$PIO_BIN" --version >/dev/null 2>&1 ); }
-check_esp32()          { ( cd "$WORKSPACE" 2>/dev/null && "$PIO_BIN" platform list --json-output 2>/dev/null | grep -Fq "$PIO_PLATFORM_PIN" ); }
+check_esp32() {
+    # JSON output has {"name":"espressif32","version":"7.0.1",...} — not the full PIN.
+    local _name _ver
+    _name=${PIO_PLATFORM_PIN##*/}; _ver=${_name##*@}; _name=${_name%%@*}
+    ( cd "$WORKSPACE" 2>/dev/null \
+        && "$PIO_BIN" platform list --json-output 2>/dev/null \
+        | grep -qF "\"name\": \"${_name}\"" )
+}
 check_libraries()      {
     [[ -d "$WORKSPACE/.pio/libdeps" ]] || return 1
     local lib pat
