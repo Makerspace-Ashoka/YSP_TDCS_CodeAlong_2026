@@ -1250,6 +1250,10 @@ function Ensure-PioOnPath {
         [Environment]::SetEnvironmentVariable('PATH', $newPath, 'User')
         Write-Status OK 'PlatformIO added to user PATH'
     }
+    # Also update the current session so child processes (VS Code) see the change immediately.
+    if ($env:PATH -notlike "*$venvScripts*") {
+        $env:PATH = $venvScripts + ';' + $env:PATH
+    }
 }
 function Check-PioPath {
     $venvScripts = Join-Path $Script:VenvDir 'Scripts'
