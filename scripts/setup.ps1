@@ -351,35 +351,21 @@ function Enable-LongPaths {
 }
 
 function Ensure-Git {
+    Refresh-Path
     if (Get-Command git -ErrorAction SilentlyContinue) {
         Write-Status SKIP "Git already installed: $((git --version) -join '')"
         return
     }
-    if (-not (Test-Admin)) {
-        Write-Status FAIL 'Git missing and cannot install without admin rights'
-        return
-    }
-    Write-Status INSTALL 'Installing Git for Windows (silent, no Explorer integration)'
-    $installer = Join-Path $Script:StateDir 'git-installer.exe'
-    $internet = 'https://github.com/git-for-windows/git/releases/latest/download/Git-64-bit.exe'
-    if (-not (Fetch-Artifact 'git' 'Git-64-bit.exe' $internet $installer)) {
-        Write-Status FAIL 'Git installer download failed'
-        return
-    }
-    $args = @(
-        '/VERYSILENT', '/NORESTART', '/NOCANCEL', '/SP-', '/SUPPRESSMSGBOXES',
-        '/COMPONENTS=gitlfs'
-    )
-    $rc = Invoke-LoggedCommand -Label 'git install' -Command $installer -ArgumentList $args
-    if ($rc -ne 0) {
-        Write-Status FAIL "Git installer exited $rc"
-        return
-    }
+    Write-Status INSTALL 'Installing Git for Windows via winget'
+    $rc = Invoke-LoggedCommand -Label 'winget install git' -Command 'winget' `
+        -ArgumentList @('install', '--id', 'Git.Git', '--silent',
+                        '--accept-package-agreements', '--accept-source-agreements',
+                        '--override', '/VERYSILENT /NORESTART /NOCANCEL /SP- /SUPPRESSMSGBOXES /COMPONENTS=gitlfs')
     Refresh-Path
     if (Get-Command git -ErrorAction SilentlyContinue) {
-        Write-Status OK 'Git installed (no desktop icon, no Explorer menu)'
+        Write-Status OK "Git installed: $((git --version) -join '')"
     } else {
-        Write-Status FAIL 'Git not on PATH after install'
+        Write-Status FAIL 'Git not on PATH after winget install'
     }
 }
 
