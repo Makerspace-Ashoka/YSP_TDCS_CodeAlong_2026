@@ -13,6 +13,7 @@
     ".tdcs_setup_state.json": true,
     "_rescued": true,
     "ronnie-robot.code-workspace": true,
+    "platformio.ini": true,
     "QUICKSTART.md": true
   },
   "editor.formatOnSave": false,
