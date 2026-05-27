@@ -1223,12 +1223,12 @@ function Run-SetupMode {
             Write-Status INFO 'First run — installing everything (10-15 minutes)'
             Ensure-Uv
             Ensure-Python
-            Ensure-Venv
-            Ensure-PlatformIO
             Ensure-Upstream
             Sync-Workspace
             Disable-GitInWorkspace
             Seed-StudentCodeIfEmpty
+            Ensure-Venv
+            Ensure-PlatformIO
             Ensure-Esp32Platform
             Ensure-Libraries
             Ensure-VsCode
