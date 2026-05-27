@@ -28,8 +28,8 @@ PIO_PLATFORM_PIN="platformio/espressif32@7.0.1"
 UPLOAD_SPEED=460800
 MONITOR_SPEED=115200
 
-MIN_DISK_GB_HARD=5
-MIN_DISK_GB_WARN=8
+MIN_DISK_GB_HARD=2
+MIN_DISK_GB_WARN=4
 MAX_CLOCK_SKEW_SEC=300
 MIN_VSCODE_VERSION_MAJOR=1
 MIN_VSCODE_VERSION_MINOR=90
@@ -71,7 +71,7 @@ EXPECTED_LIBS=(
 # VS Code extensions required for the curriculum.
 VSCODE_EXTS=(
     platformio.platformio-ide
-    ms-vscode.cpptools
+    ms-vscode.cpptools-extension-pack
     ms-vscode.vscode-serial-monitor
 )
 
@@ -1113,6 +1113,40 @@ repair_libraries()      { ensure_libraries; }
 repair_project_config() { sync_workspace; }
 repair_udev_rule()      { ensure_udev_rule; }
 
+ensure_pio_on_path() {
+    local venv_bin="$VENV_DIR/bin"
+    local rc_file
+    case "${SHELL:-}" in
+        */zsh)  rc_file="$HOME/.zshrc" ;;
+        */bash) rc_file="$HOME/.bashrc" ;;
+        *)      rc_file="" ;;
+    esac
+    if [[ -n "$rc_file" ]]; then
+        # Remove stale entries left from a workspace move.
+        if [[ -f "$rc_file" ]]; then
+            sed -i.bak '/YSP_TDCS_Makerspace.*\.venv.*bin/d' "$rc_file" \
+                && rm -f "${rc_file}.bak"
+        fi
+        if ! grep -qF "$venv_bin" "$rc_file" 2>/dev/null; then
+            printf '\n# YSP TDCS — PlatformIO\nexport PATH="%s:$PATH"\n' "$venv_bin" >> "$rc_file"
+            status OK "PlatformIO added to $rc_file"
+        fi
+    fi
+    # Also update the current session so VS Code inherits pio immediately.
+    case ":$PATH:" in *":$venv_bin:"*) ;; *) PATH="$venv_bin:$PATH"; export PATH ;; esac
+}
+check_pio_path() {
+    local venv_bin="$VENV_DIR/bin"
+    local rc_file
+    case "${SHELL:-}" in
+        */zsh)  rc_file="$HOME/.zshrc" ;;
+        */bash) rc_file="$HOME/.bashrc" ;;
+        *)      return 0 ;;
+    esac
+    [[ -f "$rc_file" ]] && grep -qF "$venv_bin" "$rc_file" 2>/dev/null
+}
+repair_pio_path() { ensure_pio_on_path; }
+
 # Format: "label:check_fn:repair_fn"
 HEALTH_CHECKS=(
     "hidden_content_cache:check_upstream:repair_upstream"
@@ -1124,6 +1158,7 @@ HEALTH_CHECKS=(
     "uv:check_uv:repair_uv"
     "python_3_11:check_python:repair_python"
     "platformio_venv:check_pio_venv:repair_pio_venv"
+    "pio_path:check_pio_path:repair_pio_path"
     "esp32_platform:check_esp32:repair_esp32"
     "libraries:check_libraries:repair_libraries"
     "project_config:check_project_config:repair_project_config"
@@ -1186,6 +1221,7 @@ run_setup_mode() {
             seed_student_code_if_empty
             ensure_venv
             ensure_platformio
+            ensure_pio_on_path
             ensure_esp32_platform
             ensure_libraries
             ensure_vscode
