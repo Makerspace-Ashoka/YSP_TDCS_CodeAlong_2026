@@ -1001,7 +1001,10 @@ function Render-SmokeProject {
             if ($line -match '^\s+') { $libDepsLines += $line }
         }
     }
-    $coreDir = (Join-Path $Script:Workspace '.pio-core') -replace '\\','\\'
+    $coreDir    = (Join-Path $Script:Workspace '.pio-core') -replace '\\','\\'
+    # Point lib_extra_dirs at the workspace's already-installed libdeps so the
+    # smoke compile does not re-download libraries from the internet.
+    $libdepsDir = (Join-Path $Script:Workspace ".pio\libdeps\$Script:PioBoard") -replace '\\','\\'
     $smokeIni = @"
 [platformio]
 core_dir = $coreDir
@@ -1012,6 +1015,7 @@ board = $($Script:PioBoard)
 framework = $($Script:PioFramework)
 monitor_speed = $($Script:MonitorSpeed)
 upload_speed = $($Script:UploadSpeed)
+lib_extra_dirs = $libdepsDir
 lib_deps =
 $($libDepsLines -join "`n")
 "@
