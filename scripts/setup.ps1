@@ -662,14 +662,16 @@ function Ensure-Venv {
         if ($rc -ne 0) { Write-Status FAIL 'uv venv failed'; return }
         Write-Status OK '.venv created'
     }
-    # PlatformIO's esptoolpy internally calls python -m pip — seed it if missing.
-    $pipExe = Join-Path $Script:VenvDir 'Scripts\pip.exe'
-    if (-not (Test-Path $pipExe)) {
-        Write-Status REPAIR 'Seeding pip into .venv (required by PlatformIO)'
-        $null = Invoke-LoggedCommand -Label 'uv pip seed' -Command 'uv' `
-            -ArgumentList @('pip','install','pip','setuptools','wheel',
-                            '--python',$Script:PythonBin) `
-            -WorkingDir $Script:Workspace
+    # PlatformIO's esptoolpy post-install calls python -m pip — ensure it works.
+    $ErrorActionPreference = 'SilentlyContinue'
+    & $Script:PythonBin -m pip --version 2>$null | Out-Null
+    $hasPip = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = 'Stop'
+    if (-not $hasPip) {
+        Write-Status REPAIR 'Seeding pip into .venv via ensurepip (required by PlatformIO)'
+        $ErrorActionPreference = 'SilentlyContinue'
+        & $Script:PythonBin -m ensurepip --upgrade 2>$null | Out-Null
+        $ErrorActionPreference = 'Stop'
     }
 }
 
@@ -699,7 +701,17 @@ function Ensure-PlatformIO {
 }
 
 function Ensure-Esp32Platform {
+    # If esptoolpy was extracted but its post-install pip step failed, package.json
+    # is absent. Remove it so PlatformIO re-downloads a clean copy.
+    $esptoolpyDir  = Join-Path $Script:Workspace '.pio-core\packages\tool-esptoolpy'
+    $esptoolpyJson = Join-Path $esptoolpyDir 'package.json'
+    if ((Test-Path $esptoolpyDir) -and -not (Test-Path $esptoolpyJson)) {
+        Write-Status REPAIR 'Removing incomplete tool-esptoolpy package'
+        Remove-Item -Recurse -Force $esptoolpyDir
+    }
+    $ErrorActionPreference = 'SilentlyContinue'
     $list = & $Script:PioBin platform list --json-output 2>$null
+    $ErrorActionPreference = 'Stop'
     if ($list -match [regex]::Escape($Script:PioPlatformPin)) {
         Write-Status SKIP "$($Script:PioPlatformPin) already installed"
         return
@@ -999,7 +1011,12 @@ upload_speed = $($Script:UploadSpeed)
 lib_deps =
 $($libDepsLines -join "`n")
 "@
-    Set-Content -Path (Join-Path $Script:SmokeDir 'platformio.ini') -Value $smokeIni -Encoding utf8
+    # PS5.1 Set-Content writes UTF-8 BOM; configparser rejects files with BOM.
+    [System.IO.File]::WriteAllText(
+        (Join-Path $Script:SmokeDir 'platformio.ini'),
+        $smokeIni,
+        [System.Text.UTF8Encoding]::new($false)
+    )
     $cpp = @'
 #include <Arduino.h>
 #include <Wire.h>
@@ -1135,11 +1152,25 @@ function Check-PythonHealth {
 }
 function Check-PioVenv {
     if (-not (Test-Path $Script:PioBin)) { return $false }
+    $ErrorActionPreference = 'SilentlyContinue'
     & $Script:PioBin --version 2>$null | Out-Null
-    return ($LASTEXITCODE -eq 0)
+    $ok = ($LASTEXITCODE -eq 0)
+    if (-not $ok) { $ErrorActionPreference = 'Stop'; return $false }
+    # pip must be importable — esptoolpy's post-install calls python -m pip
+    & $Script:PythonBin -m pip --version 2>$null | Out-Null
+    $hasPip = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = 'Stop'
+    return $hasPip
 }
 function Check-Esp32 {
+    # Incomplete esptoolpy package (pip failed during post-install) = unhealthy
+    $esptoolpyDir  = Join-Path $Script:Workspace '.pio-core\packages\tool-esptoolpy'
+    $esptoolpyJson = Join-Path $esptoolpyDir 'package.json'
+    if ((Test-Path $esptoolpyDir) -and -not (Test-Path $esptoolpyJson)) { return $false }
+    if (-not (Test-Path $Script:PioBin)) { return $false }
+    $ErrorActionPreference = 'SilentlyContinue'
     $list = & $Script:PioBin platform list --json-output 2>$null
+    $ErrorActionPreference = 'Stop'
     if (-not $list) { return $false }
     ($list -join '') -match [regex]::Escape($Script:PioPlatformPin)
 }
@@ -1174,7 +1205,25 @@ function Repair-VsCode        { Ensure-VsCode }
 function Repair-Extensions    { Ensure-Extensions }
 function Repair-Uv            { Ensure-Uv }
 function Repair-PythonHealth  { Ensure-Python }
-function Repair-PioVenv       { Remove-Item $Script:VenvDir -Recurse -Force -ErrorAction SilentlyContinue; Ensure-Venv; Ensure-PlatformIO }
+function Repair-PioVenv {
+    # If PIO works but pip is missing, just seed pip — don't nuke the whole venv.
+    if (Test-Path $Script:PioBin) {
+        $ErrorActionPreference = 'SilentlyContinue'
+        & $Script:PythonBin -m pip --version 2>$null | Out-Null
+        $hasPip = ($LASTEXITCODE -eq 0)
+        $ErrorActionPreference = 'Stop'
+        if (-not $hasPip) {
+            Write-Status REPAIR 'Seeding pip into .venv (PlatformIO intact)'
+            $ErrorActionPreference = 'SilentlyContinue'
+            & $Script:PythonBin -m ensurepip --upgrade 2>$null | Out-Null
+            $ErrorActionPreference = 'Stop'
+            return
+        }
+    }
+    Remove-Item $Script:VenvDir -Recurse -Force -ErrorAction SilentlyContinue
+    Ensure-Venv
+    Ensure-PlatformIO
+}
 function Repair-Esp32         { Ensure-Esp32Platform }
 function Repair-LibrariesHealth { Ensure-Libraries }
 function Repair-ProjectConfig { Sync-Workspace }
