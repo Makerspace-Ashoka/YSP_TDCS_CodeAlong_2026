@@ -45,8 +45,7 @@ $Script:InstructorPaths = @(
     '.python-version',
     'requirements.txt',
     'QUICKSTART.md',
-    '.vscode',
-    'ronnie-robot.code-workspace'
+    '.vscode'
 )
 
 # Student-owned paths — NEVER overwritten by sync.
@@ -739,9 +738,13 @@ function Ensure-Libraries {
     if (-not (Test-Path (Join-Path $Script:Workspace 'platformio.ini'))) {
         Write-Status FAIL 'platformio.ini missing'; return
     }
+    Write-Status INSTALL "Installing $($Script:ExpectedLibs.Count) libraries — this may take 1-2 minutes"
+    foreach ($lib in $Script:ExpectedLibs) { Write-Status INFO "  · $lib" }
+    Write-Status INFO '  Resolving dependencies and downloading from registry...'
     $rc = Invoke-LoggedCommand -Label 'pio pkg install' -Command $Script:PioBin `
         -ArgumentList @('pkg','install') -WorkingDir $Script:Workspace
     if ($rc -ne 0) { Write-Status FAIL 'pio pkg install failed'; return }
+    Write-Status INFO '  Verifying installed packages...'
 
     $libdeps = Join-Path $Script:Workspace '.pio\libdeps'
     if (-not (Test-Path $libdeps)) { Write-Status FAIL 'libdeps directory missing'; return }
@@ -750,10 +753,10 @@ function Ensure-Libraries {
         $pat = ($lib -split ' ')[0]
         $found = Get-ChildItem -Path $libdeps -Directory -Recurse -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -like "*$pat*" }
-        if (-not $found) { Write-Status FAIL "Library missing: $lib"; $missing++ }
+        if ($found) { Write-Status OK "  $lib" } else { Write-Status FAIL "Library missing: $lib"; $missing++ }
     }
     if ($missing -eq 0) {
-        Write-Status OK "Libraries installed: $($Script:ExpectedLibs.Count)/$($Script:ExpectedLibs.Count)"
+        Write-Status OK "All $($Script:ExpectedLibs.Count) libraries ready"
     }
 }
 
@@ -853,6 +856,10 @@ function Sync-Workspace {
     }
     Promote-LogToWorkspace
     Disable-GitInWorkspace
+
+    # Remove the workspace file that triggers VS Code's "Open as workspace?" toast.
+    $staleWs = Join-Path $Script:Workspace 'ronnie-robot.code-workspace'
+    if (Test-Path $staleWs) { Remove-Item $staleWs -Force -ErrorAction SilentlyContinue }
 
     $oldSha = (& git -C $Script:UpstreamDir rev-parse HEAD 2>$null)
     Invoke-LoggedCommand -Label 'git fetch' -Command 'git' `
@@ -967,6 +974,7 @@ function Ensure-Extensions {
         if ($installed -contains $ext.ToLower()) {
             Write-Status SKIP "ext $ext"; continue
         }
+        Write-Status INSTALL "ext $ext — downloading from marketplace..."
         $ok = Install-OneExtension $ext
         if (-not $ok) { $ok = Install-OneExtension $ext }
         if (-not $ok) { Write-Status FAIL "ext $ext could not be installed" }
@@ -1367,8 +1375,9 @@ function Configure-VsCodeUserSettings {
     $obj = if (Test-Path $f) {
         try { Get-Content $f -Raw | ConvertFrom-Json } catch { [pscustomobject]@{} }
     } else { [pscustomobject]@{} }
-    $obj | Add-Member -NotePropertyName 'security.workspace.trust.enabled' -NotePropertyValue $false -Force
-    $obj | Add-Member -NotePropertyName 'platformio-ide.customPATH'        -NotePropertyValue (Join-Path $Script:VenvDir 'Scripts') -Force
+    $obj | Add-Member -NotePropertyName 'security.workspace.trust.enabled'   -NotePropertyValue $false -Force
+    $obj | Add-Member -NotePropertyName 'platformio-ide.customPATH'          -NotePropertyValue (Join-Path $Script:VenvDir 'Scripts') -Force
+    $obj | Add-Member -NotePropertyName 'workbench.secondarySideBar.visible' -NotePropertyValue $false -Force
     if (-not (Test-Path $userDir)) { New-Item -ItemType Directory -Path $userDir -Force | Out-Null }
     [System.IO.File]::WriteAllText($f, ($obj | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
 }

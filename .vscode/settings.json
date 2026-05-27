@@ -12,7 +12,6 @@
     "setup_log.txt": true,
     ".tdcs_setup_state.json": true,
     "_rescued": true,
-    "ronnie-robot.code-workspace": true,
     "QUICKSTART.md": true
   },
   "window.title": "My Robot — ${activeEditorShort}",
