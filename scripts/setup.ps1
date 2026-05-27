@@ -646,19 +646,31 @@ function Ensure-Venv {
     if (-not (Test-Path $Script:Workspace)) {
         New-Item -ItemType Directory -Path $Script:Workspace -Force | Out-Null
     }
+    $venvOk = $false
     if (Test-Path $Script:PythonBin) {
         $v = (& $Script:PythonBin --version) -join ''
         if ($v -match "Python $([regex]::Escape($Script:PythonVersion))\.") {
             Write-Status SKIP ".venv already on Python $($Script:PythonVersion)"
-            return
+            $venvOk = $true
         }
     }
-    Write-Status REPAIR "Creating $($Script:VenvDir)"
-    $rc = Invoke-LoggedCommand -Label 'uv venv' -Command 'uv' `
-        -ArgumentList @('venv','--python',$Script:PythonVersion,'.venv') `
-        -WorkingDir $Script:Workspace
-    if ($rc -ne 0) { Write-Status FAIL 'uv venv failed'; return }
-    Write-Status OK '.venv created'
+    if (-not $venvOk) {
+        Write-Status REPAIR "Creating $($Script:VenvDir)"
+        $rc = Invoke-LoggedCommand -Label 'uv venv' -Command 'uv' `
+            -ArgumentList @('venv','--python',$Script:PythonVersion,'--seed','.venv') `
+            -WorkingDir $Script:Workspace
+        if ($rc -ne 0) { Write-Status FAIL 'uv venv failed'; return }
+        Write-Status OK '.venv created'
+    }
+    # PlatformIO's esptoolpy internally calls python -m pip — seed it if missing.
+    $pipExe = Join-Path $Script:VenvDir 'Scripts\pip.exe'
+    if (-not (Test-Path $pipExe)) {
+        Write-Status REPAIR 'Seeding pip into .venv (required by PlatformIO)'
+        $null = Invoke-LoggedCommand -Label 'uv pip seed' -Command 'uv' `
+            -ArgumentList @('pip','install','pip','setuptools','wheel',
+                            '--python',$Script:PythonBin) `
+            -WorkingDir $Script:Workspace
+    }
 }
 
 function Ensure-VenvAndPio { Ensure-Venv; Ensure-PlatformIO }
