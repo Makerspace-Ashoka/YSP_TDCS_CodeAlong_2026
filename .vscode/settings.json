@@ -1,5 +1,20 @@
 {
-  "files.autoSave": "onFocusChange",
+  "files.autoSave": "afterDelay",
+  "files.autoSaveDelay": 500,
+  "files.exclude": {
+    ".pio": true,
+    ".pio-core": true,
+    ".venv": true,
+    "robot_core": true,
+    "requirements.txt": true,
+    ".python-version": true,
+    "setup_log.txt": true,
+    ".tdcs_setup_state.json": true,
+    "_rescued": true,
+    "ronnie-robot.code-workspace": true,
+    "platformio.ini": true,
+    "QUICKSTART.md": true
+  },
   "editor.formatOnSave": false,
   "editor.fontSize": 15,
   "git.enabled": false,

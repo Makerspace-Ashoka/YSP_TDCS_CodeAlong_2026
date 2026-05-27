@@ -1239,6 +1239,25 @@ function Repair-Esp32         { Ensure-Esp32Platform }
 function Repair-LibrariesHealth { Ensure-Libraries }
 function Repair-ProjectConfig { Sync-Workspace }
 
+function Ensure-PioOnPath {
+    $venvScripts = Join-Path $Script:VenvDir 'Scripts'
+    $rawPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+    $parts   = if ($rawPath) { $rawPath -split ';' | Where-Object { $_ -ne '' } } else { @() }
+    # Remove stale entries left from a workspace move (old Desktop or home path).
+    $parts   = @($parts | Where-Object { $_ -notlike '*YSP_TDCS_Makerspace*\.venv*' })
+    if ($parts -notcontains $venvScripts) {
+        $newPath = ((@($venvScripts) + $parts) -join ';').TrimEnd(';')
+        [Environment]::SetEnvironmentVariable('PATH', $newPath, 'User')
+        Write-Status OK 'PlatformIO added to user PATH'
+    }
+}
+function Check-PioPath {
+    $venvScripts = Join-Path $Script:VenvDir 'Scripts'
+    $path = [Environment]::GetEnvironmentVariable('PATH', 'User')
+    return $path -and (($path -split ';') -contains $venvScripts)
+}
+function Repair-PioPath { Ensure-PioOnPath }
+
 $Script:HealthChecks = @(
     @{ Label='hidden_content_cache';  Check='Check-Upstream';        Repair='Repair-Upstream' },
     @{ Label='student_workspace';     Check='Check-WorkspaceDir';    Repair='Repair-WorkspaceDir' },
@@ -1249,6 +1268,7 @@ $Script:HealthChecks = @(
     @{ Label='uv';                    Check='Check-Uv';              Repair='Repair-Uv' },
     @{ Label='python_3_11';           Check='Check-PythonHealth';    Repair='Repair-PythonHealth' },
     @{ Label='platformio_venv';       Check='Check-PioVenv';         Repair='Repair-PioVenv' },
+    @{ Label='pio_path';              Check='Check-PioPath';          Repair='Repair-PioPath' },
     @{ Label='esp32_platform';        Check='Check-Esp32';           Repair='Repair-Esp32' },
     @{ Label='libraries';             Check='Check-LibrariesHealth'; Repair='Repair-LibrariesHealth' },
     @{ Label='project_config';        Check='Check-ProjectConfig';   Repair='Repair-ProjectConfig' }
@@ -1301,6 +1321,7 @@ function Run-SetupMode {
             Seed-StudentCodeIfEmpty
             Ensure-Venv
             Ensure-PlatformIO
+            Ensure-PioOnPath
             Ensure-Esp32Platform
             Ensure-Libraries
             Ensure-VsCode
