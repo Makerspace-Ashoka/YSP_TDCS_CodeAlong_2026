@@ -794,22 +794,23 @@ _install_vscode_mac() {
         || { status FAIL "VS Code unzip to /Applications failed (check disk space and admin access)"; return 1; }
     rm -f "$zip"
     _ensure_code_symlink_mac
+    refresh_path
     code --version >/dev/null 2>&1 || { status FAIL "VS Code not runnable after install"; return 1; }
     status OK "VS Code installed"
 }
 
 _ensure_code_symlink_mac() {
     [[ "$OS" == mac ]] || return 0
+    refresh_path
     if command -v code >/dev/null 2>&1; then return 0; fi
     local target="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
     [[ -x "$target" ]] || return 0
-    # Try without sudo first (in case /usr/local/bin is writable).
+    # Try /usr/local/bin (system-wide); fall back to ~/.local/bin (no sudo needed).
     if ln -sf "$target" /usr/local/bin/code 2>/dev/null; then return 0; fi
-    if command -v sudo >/dev/null 2>&1; then
-        sudo -n ln -sf "$target" /usr/local/bin/code 2>/dev/null && return 0
-        status INFO "Creating /usr/local/bin/code symlink (sudo password)"
-        sudo ln -sf "$target" /usr/local/bin/code || status WARN "Could not create code CLI symlink"
-    fi
+    sudo -n ln -sf "$target" /usr/local/bin/code 2>/dev/null && return 0
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$target" "$HOME/.local/bin/code" && refresh_path && return 0
+    status WARN "Could not create code CLI symlink"
 }
 
 _install_vscode_linux() {
