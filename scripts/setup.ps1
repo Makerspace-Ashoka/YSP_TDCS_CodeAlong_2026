@@ -31,8 +31,8 @@ $Script:PioPlatformPin = 'platformio/espressif32@7.0.1'
 $Script:UploadSpeed    = 460800
 $Script:MonitorSpeed   = 115200
 
-$Script:MinDiskGbHard           = 3
-$Script:MinDiskGbWarn           = 5
+$Script:MinDiskGbHard           = 2
+$Script:MinDiskGbWarn           = 4
 $Script:MaxClockSkewSec         = 300
 $Script:MinVscodeVersionMajor   = 1
 $Script:MinVscodeVersionMinor   = 90
@@ -709,10 +709,14 @@ function Ensure-Esp32Platform {
         Write-Status REPAIR 'Removing incomplete tool-esptoolpy package'
         Remove-Item -Recurse -Force $esptoolpyDir
     }
-    $ErrorActionPreference = 'SilentlyContinue'
-    $list = & $Script:PioBin platform list --json-output 2>$null
-    $ErrorActionPreference = 'Stop'
-    if ($list -match [regex]::Escape($Script:PioPlatformPin)) {
+    # Use filesystem check: pio platform list --json-output uses the *default*
+    # ~/.platformio dir, not our custom .pio-core, and always returns [].
+    $pkgsDir  = Join-Path $Script:Workspace '.pio-core\packages'
+    $toolchain = if (Test-Path $pkgsDir) {
+        Get-ChildItem $pkgsDir -Directory -Filter 'toolchain-xtensa*' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+    } else { $null }
+    if ($null -ne $toolchain) {
         Write-Status SKIP "$($Script:PioPlatformPin) already installed"
         return
     }
@@ -1163,16 +1167,17 @@ function Check-PioVenv {
     return $hasPip
 }
 function Check-Esp32 {
-    # Incomplete esptoolpy package (pip failed during post-install) = unhealthy
+    # Incomplete esptoolpy = unhealthy (pip failed during post-install)
     $esptoolpyDir  = Join-Path $Script:Workspace '.pio-core\packages\tool-esptoolpy'
     $esptoolpyJson = Join-Path $esptoolpyDir 'package.json'
     if ((Test-Path $esptoolpyDir) -and -not (Test-Path $esptoolpyJson)) { return $false }
-    if (-not (Test-Path $Script:PioBin)) { return $false }
-    $ErrorActionPreference = 'SilentlyContinue'
-    $list = & $Script:PioBin platform list --json-output 2>$null
-    $ErrorActionPreference = 'Stop'
-    if (-not $list) { return $false }
-    ($list -join '') -match [regex]::Escape($Script:PioPlatformPin)
+    # Use filesystem check — pio platform list uses the default ~/.platformio dir,
+    # not our custom .pio-core core_dir, so it always returns empty.
+    $pkgsDir = Join-Path $Script:Workspace '.pio-core\packages'
+    if (-not (Test-Path $pkgsDir)) { return $false }
+    $toolchain = Get-ChildItem $pkgsDir -Directory -Filter 'toolchain-xtensa*' -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+    return ($null -ne $toolchain)
 }
 function Check-LibrariesHealth {
     $libdeps = Join-Path $Script:Workspace '.pio\libdeps'
