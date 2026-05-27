@@ -518,16 +518,22 @@ function Cache-MirrorManifest {
     }
 }
 
-function Run-BootstrapChecks {
+function Run-LocalBootstrapChecks {
+    # Fast, offline — always run before mode detection.
     Test-PowerShellVersion
     Enable-Tls12
     Check-DiskSpace
-    Check-ClockSkew
     Check-WriteAccess
-    Check-HttpsReachable
-    Discover-Mirror
     Add-DefenderExclusions
     Enable-LongPaths
+}
+
+function Run-NetworkBootstrapChecks {
+    # Slow — clock probe, HTTPS check, subnet mirror scan, git install.
+    # Only needed when we are about to download something (first_run / repair).
+    Check-ClockSkew
+    Check-HttpsReachable
+    Discover-Mirror
     Ensure-Git
 }
 
@@ -1478,9 +1484,10 @@ function Invoke-Main {
     Start-SetupLog
     Ensure-ElevationIfNeeded
     Migrate-WorkspaceIfNeeded
-    Run-BootstrapChecks
+    Run-LocalBootstrapChecks
     $Script:Mode = Detect-SetupMode
     Write-Log "Detected mode: $($Script:Mode)"
+    if ($Script:Mode -ne 'daily') { Run-NetworkBootstrapChecks }
     Run-SetupMode $Script:Mode
     Write-FinalSummary
     Open-VsCode-IfSafe
