@@ -393,7 +393,7 @@ discover_mirror() {
             [[ "$host" == "$self" ]] && continue
             candidates+=("$host")
         done
-        for host in "${candidates[@]}"; do
+        for host in ${candidates[@]+"${candidates[@]}"}; do
             if curl -fsS --max-time 0.5 "http://$host:$MIRROR_PORT/ping" >/dev/null 2>&1; then
                 MIRROR_BASE="http://$host:$MIRROR_PORT"
                 status OK "Local mirror found at $MIRROR_BASE — large files will download locally"
@@ -549,7 +549,7 @@ ensure_platformio() {
     (
         cd "$WORKSPACE" \
             && run_cmd "uv pip install platformio" -- \
-                uv pip install --python .venv "${find_links[@]}" -r requirements.txt
+                uv pip install --python .venv ${find_links[@]+"${find_links[@]}"} -r requirements.txt
     ) || { status FAIL "PlatformIO install failed"; return 1; }
     status OK "PlatformIO $($PIO_BIN --version | awk '{print $NF}') installed"
 }
@@ -1178,7 +1178,7 @@ write_final_summary() {
     if (( COUNT_FAIL > 0 )); then
         printf '\n  %sFailed steps:%s\n' "$C_RED" "$C_RESET"
         local s
-        for s in "${FAILED_STEPS[@]}"; do
+        for s in ${FAILED_STEPS[@]+"${FAILED_STEPS[@]}"}; do
             printf '    - %s\n' "$s"
         done
         printf '\n  Setup incomplete — show this screen to an instructor.\n'
