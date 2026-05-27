@@ -624,8 +624,11 @@ function Ensure-Uv {
 
 function Ensure-Python {
     Refresh-Path
-    $check = & uv python find $Script:PythonVersion 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    $ErrorActionPreference = 'SilentlyContinue'
+    & uv python find $Script:PythonVersion 2>$null | Out-Null
+    $pythonFound = ($LASTEXITCODE -eq 0)
+    $ErrorActionPreference = 'Stop'
+    if ($pythonFound) {
         Write-Status SKIP "Python $($Script:PythonVersion) already managed by uv"
         return
     }
