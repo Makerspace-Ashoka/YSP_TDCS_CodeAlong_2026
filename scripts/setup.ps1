@@ -360,7 +360,7 @@ function Ensure-Git {
     $rc = Invoke-LoggedCommand -Label 'winget install git' -Command 'winget' `
         -ArgumentList @('install', '--id', 'Git.Git', '--silent',
                         '--accept-package-agreements', '--accept-source-agreements',
-                        '--override', '/VERYSILENT /NORESTART /NOCANCEL /SP- /SUPPRESSMSGBOXES /COMPONENTS=gitlfs')
+                        '--disable-interactivity')
     Refresh-Path
     if (Get-Command git -ErrorAction SilentlyContinue) {
         Write-Status OK "Git installed: $((git --version) -join '')"
@@ -607,7 +607,9 @@ function Ensure-Uv {
             $entry = Get-MirrorEntry -Category 'uv' -Name 'install.ps1'
             if ($entry -and $entry.Url) { $installerUrl = $entry.Url }
         }
-        Invoke-Expression (Invoke-WebRequest -Uri $installerUrl -UseBasicParsing -TimeoutSec 60).Content
+        $raw = (Invoke-WebRequest -Uri $installerUrl -UseBasicParsing -TimeoutSec 60).Content
+        if ($raw -is [byte[]]) { $raw = [System.Text.Encoding]::UTF8.GetString($raw) }
+        Invoke-Expression $raw
     } catch {
         Write-Status FAIL "uv install failed: $_"
         return
