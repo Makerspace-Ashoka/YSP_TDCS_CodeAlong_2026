@@ -13,10 +13,13 @@
     ".tdcs_setup_state.json": true,
     "_rescued": true,
     "ronnie-robot.code-workspace": true,
-    "platformio.ini": true,
     "QUICKSTART.md": true
   },
   "window.title": "My Robot — ${activeEditorShort}",
+  "files.readonlyInclude": {
+    "**/platformio.ini": true,
+    "**/robot_core/**": true
+  },
   "editor.formatOnSave": false,
   "editor.fontSize": 15,
   "git.enabled": false,
