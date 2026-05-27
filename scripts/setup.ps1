@@ -71,7 +71,7 @@ $Script:ExpectedLibs = @(
 
 $Script:VscodeExts = @(
     'platformio.platformio-ide',
-    'ms-vscode.cpptools',
+    'ms-vscode.cpptools-extension-pack',
     'ms-vscode.vscode-serial-monitor'
 )
 
