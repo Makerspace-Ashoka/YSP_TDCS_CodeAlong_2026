@@ -785,7 +785,7 @@ ensure_vscode() {
 
 _install_vscode_mac() {
     local dmg="$STATE_DIR/VSCode.dmg"
-    local internet="https://code.visualstudio.com/sha/download?build=stable&os=darwin-universal"
+    local internet="https://update.code.visualstudio.com/latest/darwin-universal/stable"
     status INSTALL "Downloading VS Code"
     fetch_artifact vscode "VSCode-darwin-universal.dmg" "$internet" "$dmg" \
         || { status FAIL "VS Code download failed"; return 1; }
