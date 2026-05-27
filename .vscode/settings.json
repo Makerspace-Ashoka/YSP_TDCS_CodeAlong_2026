@@ -25,6 +25,8 @@
   "git.enabled": false,
   "git.autorefresh": false,
   "git.confirmSync": false,
+  "chat.commandCenter.enabled": false,
+  "workbench.secondarySideBar.visible": false,
   "platformio-ide.useBuiltinPIOCore": false,
   "platformio-ide.disablePIOHomeStartup": true,
   "platformio-ide.activateProjectOnTextEditorChanged": true,
