@@ -48,7 +48,7 @@ You only need to do this once per session.
 - A self-contained Python 3.11 environment (via `uv` — does **not** touch your system Python)
 - PlatformIO Core and the ESP32 Arduino toolchain for the Seeed Studio XIAO ESP32C3
 - The class's Arduino libraries (Adafruit PWM Servo Driver, BusIO, NewPing, ArduinoJson, ESP32Servo)
-- Your class workspace at `~/YSP_TDCS_Makerspace/`
+- Your class workspace at `~/Desktop/YSP_TDCS_Makerspace/` (on your Desktop)
 
 It does **not** install Homebrew, ask you any setup-time questions, or touch your existing tools. Re-running is always safe.
 
@@ -70,4 +70,4 @@ curl -fsSL https://raw.githubusercontent.com/Makerspace-Ashoka/YSP_TDCS_CodeAlon
 powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Makerspace-Ashoka/YSP_TDCS_CodeAlong_2026/main/scripts/diagnose.ps1 | iex"
 ```
 
-Full setup log is at `~/YSP_TDCS_Makerspace/setup_log.txt`.
+Full setup log is at `~/Desktop/YSP_TDCS_Makerspace/setup_log.txt`.

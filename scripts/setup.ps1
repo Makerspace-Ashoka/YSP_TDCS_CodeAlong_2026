@@ -83,8 +83,10 @@ $Script:BootstrapLog   = Join-Path $Script:StateDir 'setup_bootstrap.log'
 $Script:MirrorCache    = Join-Path $Script:StateDir 'mirror_cache'
 $Script:MirrorManifest = Join-Path $Script:MirrorCache 'manifest.json'
 
-# Student-facing workspace.
-$Script:Workspace        = Join-Path $HOME 'YSP_TDCS_Makerspace'
+# Student-facing workspace — on the Desktop so students can find it easily.
+$_desktop                = [System.Environment]::GetFolderPath('Desktop')
+if (-not $_desktop) { $_desktop = Join-Path $HOME 'Desktop' }
+$Script:Workspace        = Join-Path $_desktop 'YSP_TDCS_Makerspace'
 $Script:WorkspaceLog     = Join-Path $Script:Workspace 'setup_log.txt'
 $Script:DiagState        = Join-Path $Script:Workspace '.tdcs_setup_state.json'
 $Script:RescueDir        = Join-Path $Script:Workspace '_rescued'
@@ -1409,6 +1411,27 @@ function Open-VsCode-IfSafe {
 }
 
 # =============================================================================
+#  WORKSPACE MIGRATION
+# =============================================================================
+
+function Migrate-WorkspaceIfNeeded {
+    # Older installs lived at ~/YSP_TDCS_Makerspace; move to Desktop on first run
+    # after this change so existing students don't lose their work.
+    $oldWs = Join-Path $HOME 'YSP_TDCS_Makerspace'
+    if (-not (Test-Path $oldWs)) { return }
+    if (Test-Path $Script:Workspace) { return }
+    $parentDir = Split-Path $Script:Workspace -Parent
+    if (-not (Test-Path $parentDir)) { return }
+    Write-Status INFO "Moving workspace to Desktop..."
+    try {
+        Move-Item -Path $oldWs -Destination $Script:Workspace -Force
+        Write-Status OK "Workspace moved to Desktop"
+    } catch {
+        Write-Status WARN "Could not move workspace automatically: $_"
+    }
+}
+
+# =============================================================================
 #  MAIN
 # =============================================================================
 
@@ -1416,6 +1439,7 @@ function Invoke-Main {
     Initialize-Console
     Start-SetupLog
     Ensure-ElevationIfNeeded
+    Migrate-WorkspaceIfNeeded
     Run-BootstrapChecks
     $Script:Mode = Detect-SetupMode
     Write-Log "Detected mode: $($Script:Mode)"

@@ -84,7 +84,7 @@ MIRROR_CACHE="$STATE_DIR/mirror_cache"
 MIRROR_MANIFEST="$MIRROR_CACHE/manifest.json"
 
 # Student-facing workspace.
-WORKSPACE="$HOME/YSP_TDCS_Makerspace"
+WORKSPACE="$HOME/Desktop/YSP_TDCS_Makerspace"
 WORKSPACE_LOG="$WORKSPACE/setup_log.txt"
 DIAG_STATE="$WORKSPACE/.tdcs_setup_state.json"
 RESCUE_DIR="$WORKSPACE/_rescued"
