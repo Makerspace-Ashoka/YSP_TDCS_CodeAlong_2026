@@ -681,7 +681,6 @@ function Ensure-Venv {
     }
 }
 
-function Ensure-VenvAndPio { Ensure-Venv; Ensure-PlatformIO }
 
 # =============================================================================
 #  TASK 7 — PLATFORMIO + ESP32 + LIBRARIES
@@ -738,13 +737,30 @@ function Ensure-Libraries {
     if (-not (Test-Path (Join-Path $Script:Workspace 'platformio.ini'))) {
         Write-Status FAIL 'platformio.ini missing'; return
     }
-    Write-Status INSTALL "Installing $($Script:ExpectedLibs.Count) libraries — this may take 1-2 minutes"
+    Write-Status INSTALL "Installing $($Script:ExpectedLibs.Count) libraries (2-5 min):"
     foreach ($lib in $Script:ExpectedLibs) { Write-Status INFO "  · $lib" }
-    Write-Status INFO '  Resolving dependencies and downloading from registry...'
-    $rc = Invoke-LoggedCommand -Label 'pio pkg install' -Command $Script:PioBin `
-        -ArgumentList @('pkg','install') -WorkingDir $Script:Workspace
-    if ($rc -ne 0) { Write-Status FAIL 'pio pkg install failed'; return }
-    Write-Status INFO '  Verifying installed packages...'
+
+    # Run pio pkg install in background so a live spinner shows it isn't frozen.
+    $tmpOut = New-TemporaryFile; $tmpErr = New-TemporaryFile
+    $proc = Start-Process -FilePath $Script:PioBin `
+        -ArgumentList @('pkg', 'install') `
+        -WorkingDirectory $Script:Workspace `
+        -NoNewWindow -PassThru `
+        -RedirectStandardOutput $tmpOut.FullName `
+        -RedirectStandardError  $tmpErr.FullName
+    $chars = '-\|/'
+    $i = 0
+    while (-not $proc.HasExited) {
+        Write-Host ("`r  [{0}] Downloading from registry..." -f $chars[$i % 4]) -NoNewline
+        $i++; Start-Sleep -Milliseconds 250
+    }
+    Write-Host "`r  Done.                                " # clear spinner line
+
+    Get-Content $tmpOut.FullName, $tmpErr.FullName -ErrorAction SilentlyContinue |
+        ForEach-Object { Write-Log $_ }
+    Remove-Item $tmpOut.FullName, $tmpErr.FullName -ErrorAction SilentlyContinue
+
+    if ($proc.ExitCode -ne 0) { Write-Status FAIL 'pio pkg install failed'; return }
 
     $libdeps = Join-Path $Script:Workspace '.pio\libdeps'
     if (-not (Test-Path $libdeps)) { Write-Status FAIL 'libdeps directory missing'; return }
@@ -755,9 +771,7 @@ function Ensure-Libraries {
             Where-Object { $_.Name -like "*$pat*" }
         if ($found) { Write-Status OK "  $lib" } else { Write-Status FAIL "Library missing: $lib"; $missing++ }
     }
-    if ($missing -eq 0) {
-        Write-Status OK "All $($Script:ExpectedLibs.Count) libraries ready"
-    }
+    if ($missing -eq 0) { Write-Status OK "All $($Script:ExpectedLibs.Count) libraries installed" }
 }
 
 # =============================================================================
@@ -948,18 +962,27 @@ function Ensure-VsCode {
         }
         Write-Status WARN "VS Code $ver below minimum; reinstalling"
     }
-    $installer = Join-Path $Script:StateDir 'VSCodeSetup.exe'
-    $internet = 'https://code.visualstudio.com/sha/download?build=stable&os=win32-x64-user'
-    Write-Status INSTALL 'Downloading VS Code'
-    if (-not (Fetch-Artifact 'vscode' 'VSCodeSetup-x64.exe' $internet $installer)) {
-        Write-Status FAIL 'VS Code download failed'; return
+    Write-Status INSTALL 'Installing VS Code via winget...'
+    $rc = Invoke-LoggedCommand -Label 'winget install vscode' -Command 'winget' `
+        -ArgumentList @('install', '--id', 'Microsoft.VisualStudioCode', '--silent',
+                        '--accept-package-agreements', '--accept-source-agreements',
+                        '--disable-interactivity')
+    if ($rc -ne 0) {
+        Write-Status WARN "winget failed (rc=$rc) — falling back to direct download"
+        $installer = Join-Path $Script:StateDir 'VSCodeSetup.exe'
+        $internet  = 'https://code.visualstudio.com/sha/download?build=stable&os=win32-x64-user'
+        Write-Status INSTALL 'Downloading VS Code installer...'
+        if (-not (Fetch-Artifact 'vscode' 'VSCodeSetup-x64.exe' $internet $installer)) {
+            Write-Status FAIL 'VS Code download failed'; return
+        }
+        $installArgs = @('/VERYSILENT', '/NORESTART',
+                         '/MERGETASKS=!desktopicon,!quicklaunchicon,!associatewithfiles,!addcontextmenufiles,!addcontextmenufolders,addtopath')
+        $rc = Invoke-LoggedCommand -Label 'vscode install' -Command $installer -ArgumentList $installArgs
+        if ($rc -ne 0) { Write-Status FAIL "VS Code installer exited $rc"; return }
     }
-    $args = @('/VERYSILENT','/NORESTART','/MERGETASKS=!desktopicon,!quicklaunchicon,!associatewithfiles,!addcontextmenufiles,!addcontextmenufolders,addtopath')
-    $rc = Invoke-LoggedCommand -Label 'vscode install' -Command $installer -ArgumentList $args
-    if ($rc -ne 0) { Write-Status FAIL "VS Code installer exited $rc"; return }
     Refresh-Path
     if (Get-Command code -ErrorAction SilentlyContinue) {
-        Write-Status OK 'VS Code installed (no desktop icon, no context menus)'
+        Write-Status OK 'VS Code installed'
     } else {
         Write-Status FAIL 'VS Code not on PATH after install — open a fresh PowerShell window'
     }
@@ -1366,19 +1389,22 @@ function Write-FinalSummary {
 }
 
 function Configure-VsCodeUserSettings {
-    # Write machine-specific VS Code user settings:
-    #   - Disable workspace trust prompts (controlled lab, all code is instructor-provided)
-    #   - Set customPATH so PIO extension finds our venv pio regardless of how VS Code was opened
     $userDir = Join-Path $env:APPDATA 'Code\User'
-    if (-not (Test-Path $userDir)) { return }
+    if (-not (Test-Path $userDir)) { New-Item -ItemType Directory -Path $userDir -Force | Out-Null }
     $f   = Join-Path $userDir 'settings.json'
     $obj = if (Test-Path $f) {
         try { Get-Content $f -Raw | ConvertFrom-Json } catch { [pscustomobject]@{} }
     } else { [pscustomobject]@{} }
-    $obj | Add-Member -NotePropertyName 'security.workspace.trust.enabled'   -NotePropertyValue $false -Force
-    $obj | Add-Member -NotePropertyName 'platformio-ide.customPATH'          -NotePropertyValue (Join-Path $Script:VenvDir 'Scripts') -Force
-    $obj | Add-Member -NotePropertyName 'workbench.secondarySideBar.visible' -NotePropertyValue $false -Force
-    if (-not (Test-Path $userDir)) { New-Item -ItemType Directory -Path $userDir -Force | Out-Null }
+    # Suppress distracting popups, panels, and prompts on first open
+    $obj | Add-Member -NotePropertyName 'security.workspace.trust.enabled'               -NotePropertyValue $false -Force
+    $obj | Add-Member -NotePropertyName 'platformio-ide.customPATH'                      -NotePropertyValue (Join-Path $Script:VenvDir 'Scripts') -Force
+    $obj | Add-Member -NotePropertyName 'workbench.secondarySideBar.visible'             -NotePropertyValue $false -Force
+    $obj | Add-Member -NotePropertyName 'workbench.startupEditor'                        -NotePropertyValue 'none' -Force
+    $obj | Add-Member -NotePropertyName 'workbench.welcomePage.walkthroughs.openOnInstall' -NotePropertyValue $false -Force
+    $obj | Add-Member -NotePropertyName 'workbench.tips.enabled'                         -NotePropertyValue $false -Force
+    $obj | Add-Member -NotePropertyName 'chat.commandCenter.enabled'                     -NotePropertyValue $false -Force
+    $obj | Add-Member -NotePropertyName 'update.showReleaseNotes'                        -NotePropertyValue $false -Force
+    $obj | Add-Member -NotePropertyName 'extensions.ignoreRecommendations'               -NotePropertyValue $true  -Force
     [System.IO.File]::WriteAllText($f, ($obj | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
 }
 
@@ -1398,16 +1424,15 @@ function Open-VsCode-IfSafe {
 
     Configure-VsCodeUserSettings
 
-    # Open as a single-root folder so PIO's workspaceContains:platformio.ini
-    # activation fires correctly and the bottom toolbar auto-appears.
-    # (.code-workspace / multi-root mode prevents PIO from auto-activating.)
+    # Open as single-root folder so PIO workspaceContains:platformio.ini activates.
+    # Use cmd /c so code.cmd doesn't block the PowerShell process.
     $codeArgs = @($Script:Workspace)
-    if ($Script:Mode -eq 'first_run') { $codeArgs += (Join-Path $Script:Workspace 'QUICKSTART.md') }
     $codeFile = Join-Path $Script:StudentCodeDir 'main.cpp'
     if (Test-Path $codeFile) { $codeArgs += $codeFile }
     try {
-        & code @codeArgs
-        Write-Status OK 'Opened workspace'
+        $quotedArgs = ($codeArgs | ForEach-Object { '"' + ($_ -replace '"','\"') + '"' }) -join ' '
+        Start-Process -FilePath 'cmd.exe' -ArgumentList "/c code $quotedArgs" -WindowStyle Hidden
+        Write-Status OK 'Opened VS Code'
     } catch {
         Write-Status WARN "VS Code did not open: $_"
     }
