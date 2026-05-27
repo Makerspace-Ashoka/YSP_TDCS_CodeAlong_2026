@@ -1103,12 +1103,11 @@ run_setup_mode() {
             status INFO "First run — installing everything (10–15 minutes)"
             ensure_uv
             ensure_python
-            ensure_venv
-            ensure_platformio
             ensure_upstream
             sync_workspace
-            disable_git_in_workspace
             seed_student_code_if_empty
+            ensure_venv
+            ensure_platformio
             ensure_esp32_platform
             ensure_libraries
             ensure_vscode
