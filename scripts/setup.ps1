@@ -1401,23 +1401,20 @@ function Write-FinalSummary {
     Write-Host "  Full log saved to $($Script:WorkspaceLog)"
 }
 
-function Set-VsCodeUserTrust {
-    # Disable workspace trust prompts — students work in a controlled lab environment.
+function Configure-VsCodeUserSettings {
+    # Write machine-specific VS Code user settings:
+    #   - Disable workspace trust prompts (controlled lab, all code is instructor-provided)
+    #   - Set customPATH so PIO extension finds our venv pio regardless of how VS Code was opened
     $userDir = Join-Path $env:APPDATA 'Code\User'
     if (-not (Test-Path $userDir)) { return }
-    $f = Join-Path $userDir 'settings.json'
-    $key = 'security.workspace.trust.enabled'
-    if (Test-Path $f) {
-        $raw = Get-Content $f -Raw -ErrorAction SilentlyContinue
-        if ($raw -match [regex]::Escape($key)) { return }
-        try {
-            $obj = $raw | ConvertFrom-Json
-            $obj | Add-Member -NotePropertyName $key -NotePropertyValue $false -Force
-            [System.IO.File]::WriteAllText($f, ($obj | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
-            return
-        } catch { }
-    }
-    [System.IO.File]::WriteAllText($f, "{`"$key`": false}", [System.Text.UTF8Encoding]::new($false))
+    $f   = Join-Path $userDir 'settings.json'
+    $obj = if (Test-Path $f) {
+        try { Get-Content $f -Raw | ConvertFrom-Json } catch { [pscustomobject]@{} }
+    } else { [pscustomobject]@{} }
+    $obj | Add-Member -NotePropertyName 'security.workspace.trust.enabled' -NotePropertyValue $false -Force
+    $obj | Add-Member -NotePropertyName 'platformio-ide.customPATH'        -NotePropertyValue (Join-Path $Script:VenvDir 'Scripts') -Force
+    if (-not (Test-Path $userDir)) { New-Item -ItemType Directory -Path $userDir -Force | Out-Null }
+    [System.IO.File]::WriteAllText($f, ($obj | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
 }
 
 function Open-VsCode-IfSafe {
@@ -1434,7 +1431,7 @@ function Open-VsCode-IfSafe {
         return
     }
 
-    Set-VsCodeUserTrust
+    Configure-VsCodeUserSettings
 
     $workspaceFile = Join-Path $Script:Workspace 'ronnie-robot.code-workspace'
 

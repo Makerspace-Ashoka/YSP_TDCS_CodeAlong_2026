@@ -5,6 +5,7 @@
     ".pio": true,
     ".pio-core": true,
     ".venv": true,
+    ".vscode": true,
     "robot_core": true,
     "requirements.txt": true,
     ".python-version": true,
@@ -12,7 +13,6 @@
     ".tdcs_setup_state.json": true,
     "_rescued": true,
     "ronnie-robot.code-workspace": true,
-    "platformio.ini": true,
     "QUICKSTART.md": true
   },
   "editor.formatOnSave": false,
