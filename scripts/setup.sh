@@ -552,7 +552,8 @@ ensure_venv() {
         return 0
     fi
     status REPAIR "Creating $VENV_DIR"
-    ( cd "$WORKSPACE" && run_cmd "uv venv" -- uv venv --python "$PYTHON_VERSION" .venv ) \
+    # --seed installs pip into the venv; PlatformIO's esptoolpy installer needs it.
+    ( cd "$WORKSPACE" && run_cmd "uv venv" -- uv venv --python "$PYTHON_VERSION" --seed .venv ) \
         || { status FAIL "uv venv failed"; return 1; }
     status OK ".venv on Python $("$PYTHON_BIN" --version | awk '{print $2}')"
 }
