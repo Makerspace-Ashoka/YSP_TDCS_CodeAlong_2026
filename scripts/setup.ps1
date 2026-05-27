@@ -1401,6 +1401,25 @@ function Write-FinalSummary {
     Write-Host "  Full log saved to $($Script:WorkspaceLog)"
 }
 
+function Set-VsCodeUserTrust {
+    # Disable workspace trust prompts — students work in a controlled lab environment.
+    $userDir = Join-Path $env:APPDATA 'Code\User'
+    if (-not (Test-Path $userDir)) { return }
+    $f = Join-Path $userDir 'settings.json'
+    $key = 'security.workspace.trust.enabled'
+    if (Test-Path $f) {
+        $raw = Get-Content $f -Raw -ErrorAction SilentlyContinue
+        if ($raw -match [regex]::Escape($key)) { return }
+        try {
+            $obj = $raw | ConvertFrom-Json
+            $obj | Add-Member -NotePropertyName $key -NotePropertyValue $false -Force
+            [System.IO.File]::WriteAllText($f, ($obj | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+            return
+        } catch { }
+    }
+    [System.IO.File]::WriteAllText($f, "{`"$key`": false}", [System.Text.UTF8Encoding]::new($false))
+}
+
 function Open-VsCode-IfSafe {
     if (-not (Test-Path $Script:Workspace) -or -not (Test-Path $Script:StudentCodeDir)) {
         Write-Status WARN 'Skipping VS Code — workspace incomplete'
@@ -1414,6 +1433,8 @@ function Open-VsCode-IfSafe {
         Write-Status WARN 'Setup incomplete — not opening VS Code automatically'
         return
     }
+
+    Set-VsCodeUserTrust
 
     $workspaceFile = Join-Path $Script:Workspace 'ronnie-robot.code-workspace'
 
