@@ -418,11 +418,37 @@ _cache_mirror_manifest() {
         || { status WARN "Mirror at $MIRROR_BASE has no manifest.json — falling back to internet"; MIRROR_BASE=""; rm -f "$MIRROR_MANIFEST"; return 1; }
 }
 
+ensure_xcode_clt() {
+    [[ "$OS" == mac ]] || return 0
+    if xcode-select -p >/dev/null 2>&1 && git --version >/dev/null 2>&1; then
+        status SKIP "Xcode CLT already installed"
+        return 0
+    fi
+    status INSTALL "Installing Xcode Command Line Tools (~900 MB, ~5–10 min)"
+    touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
+    local pkg
+    pkg=$(softwareupdate -l 2>/dev/null \
+        | awk '/\* Label:.*Command Line Tools/{gsub(/\* Label: /,""); print; exit}')
+    if [[ -z "$pkg" ]]; then
+        rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
+        status FAIL "Xcode CLT not found in softwareupdate — run: xcode-select --install"
+        return 1
+    fi
+    run_cmd "softwareupdate CLT" -- softwareupdate -i "$pkg" \
+        || { rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
+             status FAIL "Xcode CLT install failed"; return 1; }
+    rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
+    xcode-select -p >/dev/null 2>&1 \
+        || { status FAIL "Xcode CLT still not functional after install"; return 1; }
+    status OK "Xcode Command Line Tools installed"
+}
+
 run_bootstrap_checks() {
     detect_os
     check_disk_space
     check_clock_skew
     check_write_access
+    ensure_xcode_clt
     check_https_reachable
     discover_mirror
 }
