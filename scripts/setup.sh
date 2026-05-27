@@ -763,6 +763,8 @@ seed_student_code_if_empty() {
 
 ensure_vscode() {
     refresh_path
+    # On macOS, VS Code.app may exist but symlink may not be on PATH yet.
+    [[ "$OS" == mac ]] && _ensure_code_symlink_mac && refresh_path
     if command -v code >/dev/null 2>&1 && code --version >/dev/null 2>&1; then
         local ver major minor
         ver=$(code --version | head -1)
