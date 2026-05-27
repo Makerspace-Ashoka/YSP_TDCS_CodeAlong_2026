@@ -278,6 +278,23 @@ refresh_path() {
 }
 
 # =============================================================================
+#  WORKSPACE MIGRATION
+# =============================================================================
+
+migrate_workspace_if_needed() {
+    local old_ws="$HOME/YSP_TDCS_Makerspace"
+    [[ -d "$old_ws" ]] || return 0
+    [[ -d "$WORKSPACE" ]] && return 0
+    [[ -d "$(dirname "$WORKSPACE")" ]] || return 0
+    status INFO "Moving workspace to Desktop..."
+    if mv "$old_ws" "$WORKSPACE" 2>/dev/null; then
+        status OK "Workspace moved to Desktop"
+    else
+        status WARN "Could not move workspace automatically"
+    fi
+}
+
+# =============================================================================
 #  TASK 4 — BOOTSTRAP CHECKS
 # =============================================================================
 
@@ -582,6 +599,13 @@ ensure_platformio() {
 }
 
 ensure_esp32_platform() {
+    # If esptoolpy was extracted but its post-install pip step failed, package.json
+    # is absent. Remove it so PlatformIO re-downloads a clean copy.
+    local esptoolpy_dir="$WORKSPACE/.pio-core/packages/tool-esptoolpy"
+    if [[ -d "$esptoolpy_dir" && ! -f "$esptoolpy_dir/package.json" ]]; then
+        status REPAIR "Removing incomplete tool-esptoolpy package"
+        rm -rf "$esptoolpy_dir"
+    fi
     if ( cd "$WORKSPACE" && "$PIO_BIN" platform list --json-output 2>/dev/null \
             | grep -Fq "$PIO_PLATFORM_PIN" ); then
         status SKIP "$PIO_PLATFORM_PIN already installed"
@@ -911,6 +935,7 @@ render_smoke_project() {
         echo "framework = $PIO_FRAMEWORK"
         echo "monitor_speed = $MONITOR_SPEED"
         echo "upload_speed = $UPLOAD_SPEED"
+        echo "lib_extra_dirs = $WORKSPACE/.pio/libdeps/$PIO_BOARD"
         echo "lib_deps ="
         printf '%s\n' "$libdeps"
     } > "$SMOKE_DIR/platformio.ini"
@@ -1027,8 +1052,11 @@ check_extensions()     {
 }
 check_uv()             { refresh_path; command -v uv >/dev/null 2>&1 && uv --version >/dev/null 2>&1; }
 check_python()         { [[ -x "$PYTHON_BIN" ]] && "$PYTHON_BIN" --version 2>&1 | grep -q "Python ${PYTHON_VERSION}\."; }
-check_pio_venv()       { [[ -x "$PIO_BIN" ]] && ( cd "$WORKSPACE" 2>/dev/null && "$PIO_BIN" --version >/dev/null 2>&1 ); }
+check_pio_venv()       { [[ -x "$PIO_BIN" ]] && ( cd "$WORKSPACE" 2>/dev/null && "$PIO_BIN" --version >/dev/null 2>&1 ) && "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; }
 check_esp32() {
+    # Incomplete esptoolpy (dir exists, package.json missing) = unhealthy.
+    local esptoolpy_dir="$WORKSPACE/.pio-core/packages/tool-esptoolpy"
+    [[ -d "$esptoolpy_dir" && ! -f "$esptoolpy_dir/package.json" ]] && return 1
     # JSON output has {"name":"espressif32","version":"7.0.1",...} — not the full PIN.
     local _name _ver
     _name=${PIO_PLATFORM_PIN##*/}; _ver=${_name##*@}; _name=${_name%%@*}
@@ -1066,7 +1094,16 @@ repair_vscode()         { ensure_vscode; }
 repair_extensions()     { ensure_extensions; }
 repair_uv()             { ensure_uv; }
 repair_python()         { ensure_python; }
-repair_pio_venv()       { rm -rf "$VENV_DIR"; ensure_venv && ensure_platformio; }
+repair_pio_venv() {
+    # If PIO works but pip is missing, seed pip only — don't nuke the whole venv.
+    if [[ -x "$PIO_BIN" ]] && ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
+        status REPAIR "Seeding pip into .venv (PlatformIO intact)"
+        "$PYTHON_BIN" -m ensurepip --upgrade >/dev/null 2>&1 || true
+        return
+    fi
+    rm -rf "$VENV_DIR"
+    ensure_venv && ensure_platformio
+}
 repair_esp32()          { ensure_esp32_platform; }
 repair_libraries()      { ensure_libraries; }
 repair_project_config() { sync_workspace; }
@@ -1260,6 +1297,7 @@ open_vscode_if_safe() {
 main() {
     init_console
     start_setup_log
+    migrate_workspace_if_needed
     run_bootstrap_checks
     MODE=$(detect_setup_mode)
     log "Detected mode: $MODE"
