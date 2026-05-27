@@ -898,8 +898,8 @@ render_smoke_project() {
     local libdeps
     libdeps=$(awk '
         /^[[:space:]]*lib_deps[[:space:]]*=/ {hit=1; next}
-        hit && /^[[:space:]]*[A-Za-z]/ { exit }
-        hit && /^[[:space:]]/ { print }
+        hit && /^[^[:space:]]/ { exit }
+        hit { print }
     ' "$WORKSPACE/platformio.ini")
     {
         echo "[platformio]"
