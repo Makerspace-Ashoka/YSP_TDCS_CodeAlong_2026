@@ -1235,6 +1235,7 @@ main() {
 
 # Only run main when executed directly, not when sourced (e.g. by Bats tests).
 # TDCS_TEST_NO_MAIN=1 also suppresses execution for tests that exec the file.
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ -z "${TDCS_TEST_NO_MAIN:-}" ]]; then
+# When piped via `curl | bash`, BASH_SOURCE is unset; fall back to $0 so main still runs.
+if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]] && [[ -z "${TDCS_TEST_NO_MAIN:-}" ]]; then
     main "$@"
 fi
