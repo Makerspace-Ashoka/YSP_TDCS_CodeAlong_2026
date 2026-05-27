@@ -31,8 +31,8 @@ $Script:PioPlatformPin = 'platformio/espressif32@7.0.1'
 $Script:UploadSpeed    = 460800
 $Script:MonitorSpeed   = 115200
 
-$Script:MinDiskGbHard           = 5
-$Script:MinDiskGbWarn           = 8
+$Script:MinDiskGbHard           = 3
+$Script:MinDiskGbWarn           = 5
 $Script:MaxClockSkewSec         = 300
 $Script:MinVscodeVersionMajor   = 1
 $Script:MinVscodeVersionMinor   = 90
