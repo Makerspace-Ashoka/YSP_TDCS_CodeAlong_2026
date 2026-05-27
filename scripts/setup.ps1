@@ -1305,55 +1305,6 @@ function Invoke-AllHealthChecks {
     return $allOk
 }
 
-function Detect-SetupMode {
-    if (-not (Test-Path $Script:Workspace) -or
-        -not (Test-Path $Script:VenvDir) -or
-        -not (Test-Path $Script:PioBin) -or
-        -not (Test-Path (Join-Path $Script:UpstreamDir '.git'))) {
-        return 'first_run'
-    }
-    $ErrorActionPreference = 'SilentlyContinue'
-    $ok = Invoke-AllHealthChecks -Quiet
-    $ErrorActionPreference = 'Stop'
-    if ($ok) { 'daily' } else { 'repair' }
-}
-
-function Run-SetupMode {
-    param([string]$Mode)
-    switch ($Mode) {
-        'first_run' {
-            Write-Status INFO 'First run — installing everything (10-15 minutes)'
-            Ensure-Uv
-            Ensure-Python
-            Ensure-Upstream
-            Sync-Workspace
-            Disable-GitInWorkspace
-            Seed-StudentCodeIfEmpty
-            Ensure-Venv
-            Ensure-PlatformIO
-            Ensure-PioOnPath
-            Ensure-Esp32Platform
-            Ensure-Libraries
-            Ensure-VsCode
-            Ensure-Extensions
-            Run-SmokeTest | Out-Null
-        }
-        'daily' {
-            Ensure-Upstream
-            Sync-Workspace
-            Seed-StudentCodeIfEmpty
-            Invoke-AllHealthChecks | Out-Null
-            Print-PortGuidance
-        }
-        'repair' {
-            Write-Status INFO 'Repairing environment'
-            Ensure-Upstream
-            Sync-Workspace
-            Invoke-AllHealthChecks | Out-Null
-        }
-        default { Write-Status FAIL "Unknown mode: $Mode" }
-    }
-}
 
 function Print-PortGuidance {
     if (Test-Path $Script:PioBin) {
@@ -1485,10 +1436,41 @@ function Invoke-Main {
     Ensure-ElevationIfNeeded
     Migrate-WorkspaceIfNeeded
     Run-LocalBootstrapChecks
-    $Script:Mode = Detect-SetupMode
+
+    # Silent local assessment — no network, no repair output.
+    $isFirstRun = -not (Test-Path $Script:Workspace) -or
+                  -not (Test-Path $Script:VenvDir) -or
+                  -not (Test-Path $Script:PioBin) -or
+                  -not (Test-Path (Join-Path $Script:UpstreamDir '.git'))
+    $ErrorActionPreference = 'SilentlyContinue'
+    $allHealthy = if (-not $isFirstRun) { Invoke-AllHealthChecks -Quiet } else { $false }
+    $ErrorActionPreference = 'Stop'
+    $Script:Mode = if ($isFirstRun) { 'first_run' } elseif ($allHealthy) { 'daily' } else { 'repair' }
     Write-Log "Detected mode: $($Script:Mode)"
-    if ($Script:Mode -ne 'daily') { Run-NetworkBootstrapChecks }
-    Run-SetupMode $Script:Mode
+
+    # Bring in network resources only when something needs downloading or repairing.
+    if (-not $allHealthy) { Run-NetworkBootstrapChecks }
+
+    switch ($Script:Mode) {
+        'first_run' {
+            Write-Status INFO 'First run — installing everything (10-15 minutes)'
+            Ensure-Uv; Ensure-Python; Ensure-Upstream; Sync-Workspace
+            Disable-GitInWorkspace; Seed-StudentCodeIfEmpty
+            Ensure-Venv; Ensure-PlatformIO; Ensure-PioOnPath
+            Ensure-Esp32Platform; Ensure-Libraries; Ensure-VsCode; Ensure-Extensions
+            Run-SmokeTest | Out-Null
+        }
+        'repair' {
+            Write-Status INFO 'Repairing environment'
+            Ensure-Upstream; Sync-Workspace
+            Invoke-AllHealthChecks | Out-Null
+        }
+        'daily' {
+            Ensure-Upstream; Sync-Workspace; Seed-StudentCodeIfEmpty
+            Print-PortGuidance
+        }
+    }
+
     Write-FinalSummary
     Open-VsCode-IfSafe
 }
