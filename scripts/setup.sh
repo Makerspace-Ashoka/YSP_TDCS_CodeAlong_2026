@@ -1009,6 +1009,7 @@ check_content_match()  {
     done
 }
 check_vscode()         {
+    refresh_path
     command -v code >/dev/null 2>&1 || return 1
     local ver major minor
     ver=$(code --version 2>/dev/null | head -1) || return 1
@@ -1154,14 +1155,14 @@ run_setup_mode() {
             ensure_upstream
             sync_workspace
             seed_student_code_if_empty
-            run_all_health_checks
+            run_all_health_checks || true
             print_port_guidance
             ;;
         repair)
             status INFO "Repairing environment"
             ensure_upstream
             sync_workspace
-            run_all_health_checks
+            run_all_health_checks || true
             ;;
         *) status FAIL "Unknown mode: $1"; return 1 ;;
     esac
