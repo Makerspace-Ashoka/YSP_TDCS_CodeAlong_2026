@@ -529,11 +529,10 @@ function Run-LocalBootstrapChecks {
 }
 
 function Run-NetworkBootstrapChecks {
-    # Slow — clock probe, HTTPS check, subnet mirror scan, git install.
-    # Only needed when we are about to download something (first_run / repair).
+    # Slow — clock probe, HTTPS check, git install.
+    # Discover-Mirror runs separately, only on first_run when artifacts need downloading.
     Check-ClockSkew
     Check-HttpsReachable
-    Discover-Mirror
     Ensure-Git
 }
 
@@ -1454,6 +1453,7 @@ function Invoke-Main {
     switch ($Script:Mode) {
         'first_run' {
             Write-Status INFO 'First run — installing everything (10-15 minutes)'
+            Discover-Mirror
             Ensure-Uv; Ensure-Python; Ensure-Upstream; Sync-Workspace
             Disable-GitInWorkspace; Seed-StudentCodeIfEmpty
             Ensure-Venv; Ensure-PlatformIO; Ensure-PioOnPath
