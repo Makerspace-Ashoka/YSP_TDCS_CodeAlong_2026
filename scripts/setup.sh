@@ -205,6 +205,263 @@ with_spinner() {
 }
 
 # =============================================================================
+#  PHASE HEADERS + BRAILLE SPINNER  —  matches setup.ps1 UX 1:1.
+# =============================================================================
+
+SPIN_FRAMES=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+SPIN_FRAMES_ASCII=('-' '\' '|' '/')
+PROGRESS_CLEAR_WIDTH=110
+
+spin_frame() {
+    local tick=$1
+    if [[ -n "${C_MAGENTA:-}" ]]; then
+        printf '%s' "${SPIN_FRAMES[$((tick % ${#SPIN_FRAMES[@]}))]}"
+    else
+        printf '%s' "${SPIN_FRAMES_ASCII[$((tick % ${#SPIN_FRAMES_ASCII[@]}))]}"
+    fi
+}
+
+clear_progress_line() {
+    printf '\r%*s\r' "$PROGRESS_CLEAR_WIDTH" ''
+}
+
+CURRENT_PHASE=""
+PHASE_START=0
+
+write_phase() {
+    local title=$1 step=${2:-0} total=${3:-0}
+    [[ -n "$CURRENT_PHASE" ]] && stop_phase
+    local display_title
+    if (( step > 0 && total > 0 )); then
+        display_title="Step $step/$total · $title"
+    else
+        display_title="$title"
+    fi
+    CURRENT_PHASE="$display_title"
+    PHASE_START=$SECONDS
+    printf '\n'
+    if [[ -n "${C_MAGENTA:-}" ]]; then
+        printf '%s┌─%s ' "$C_MAGENTA" "$C_RESET"
+        if (( step > 0 && total > 0 )); then
+            printf '%sStep %d/%d%s %s·%s %s%s%s\n' \
+                "$C_YELLOW" "$step" "$total" "$C_RESET" \
+                "$C_DIM" "$C_RESET" \
+                "$C_BOLD" "$title" "$C_RESET"
+        else
+            printf '%s%s%s\n' "$C_BOLD" "$title" "$C_RESET"
+        fi
+    else
+        printf '== %s ==\n' "$display_title"
+    fi
+    log "=== PHASE START: $display_title ==="
+}
+
+stop_phase() {
+    [[ -n "$CURRENT_PHASE" ]] || return 0
+    local elapsed=$((SECONDS - PHASE_START))
+    if [[ -n "${C_MAGENTA:-}" ]]; then
+        printf '%s└─%s %s%s · %ds%s\n' \
+            "$C_MAGENTA" "$C_RESET" "$C_DIM" "$CURRENT_PHASE" "$elapsed" "$C_RESET"
+    else
+        printf -- '-- %s · %ds --\n' "$CURRENT_PHASE" "$elapsed"
+    fi
+    log "=== PHASE END: $CURRENT_PHASE elapsed=${elapsed}s ==="
+    CURRENT_PHASE=""
+}
+
+# =============================================================================
+#  STREAMED COMMAND RUNNER  —  runs a child process, tails stdout/stderr in real
+#  time, applies an optional line filter (function name) that sets $FILTER_OUT,
+#  and renders a single in-place status line with the braille spinner.
+#
+#  Bash version doesn't suffer the Windows-PS ExitCode race — `wait $pid; $?` is
+#  reliable. We still verify by filesystem in callers as defense-in-depth.
+# =============================================================================
+
+FILTER_OUT=""
+_LAST_STATUS=""
+
+# Read newly-appended bytes from $1 (path) starting at byte offset stored in
+# global var named $2, log each line, run $3 (filter function or empty) which
+# sets $FILTER_OUT, and update _LAST_STATUS with the latest non-empty result.
+# Advances the named position variable to the new size via eval.
+_read_stream_chunk() {
+    local path=$1 pos_var=$2 filter=$3
+    [[ -f "$path" ]] || return 0
+    local pos=${!pos_var}
+    local size
+    size=$(wc -c < "$path" 2>/dev/null | tr -d ' ')
+    size=${size:-0}
+    (( size > pos )) || return 0
+    local chunk
+    chunk=$(tail -c "+$((pos + 1))" "$path" 2>/dev/null || true)
+    eval "$pos_var=$size"
+    [[ -n "$chunk" ]] || return 0
+    local line
+    while IFS= read -r line; do
+        # Strip ANSI escapes and trim whitespace.
+        line=$(printf '%s' "$line" | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' | awk '{$1=$1; print}')
+        [[ -z "$line" ]] && continue
+        printf '%s\n' "$line" >> "$_CURRENT_LOG"
+        FILTER_OUT=""
+        if [[ -n "$filter" ]]; then
+            "$filter" "$line" || true
+        else
+            FILTER_OUT="$line"
+        fi
+        if [[ -n "$FILTER_OUT" ]]; then
+            _LAST_STATUS="$FILTER_OUT"
+            if (( ${#_LAST_STATUS} > 80 )); then
+                _LAST_STATUS="${_LAST_STATUS:0:77}..."
+            fi
+        fi
+    done <<<"$chunk"
+}
+
+# invoke_streamed LABEL PREFIX FILTER WORKDIR -- CMD [ARGS...]
+#   LABEL    — short string for the log
+#   PREFIX   — student-facing status prefix (e.g. "   libraries")
+#   FILTER   — function name to translate lines into status (or "" for raw)
+#   WORKDIR  — directory to cd into (or "" for current)
+#   --       — separator
+#   CMD ...  — the actual command + args
+# Returns the child's exit code (reliable: bash `wait $pid; $?`).
+invoke_streamed() {
+    local label=$1; shift
+    local prefix=$1; shift
+    local filter=$1; shift
+    local workdir=$1; shift
+    [[ "${1:-}" == "--" ]] && shift
+
+    local tmpout tmperr
+    tmpout=$(mktemp -t 'tdcs.out.XXXXXX')
+    tmperr=$(mktemp -t 'tdcs.err.XXXXXX')
+    local sanitized
+    sanitized=$(printf '%q ' "$@" | _redact)
+    log "+ $label: $sanitized"
+    local start=$SECONDS
+
+    # PYTHONUNBUFFERED makes pio's child python flush per line — without it,
+    # progress lines arrive in 4–8 KB chunks and the spinner shows nothing useful.
+    if [[ -n "$workdir" ]]; then
+        ( cd "$workdir" && PYTHONUNBUFFERED=1 "$@" ) >"$tmpout" 2>"$tmperr" &
+    else
+        PYTHONUNBUFFERED=1 "$@" >"$tmpout" 2>"$tmperr" &
+    fi
+    local pid=$!
+
+    local out_pos=0 err_pos=0 tick=0
+    _LAST_STATUS=""
+    local can_render=1
+    [[ -t 1 && -z "${NO_SPINNER:-}" ]] || can_render=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+        _read_stream_chunk "$tmpout" out_pos "$filter"
+        _read_stream_chunk "$tmperr" err_pos "$filter"
+        if (( can_render )); then
+            local frame msg
+            frame=$(spin_frame "$tick")
+            if [[ -n "$_LAST_STATUS" ]]; then
+                msg="$prefix · $_LAST_STATUS"
+            else
+                msg="$prefix"
+            fi
+            printf '\r  %s %-*s' "$frame" "$((PROGRESS_CLEAR_WIDTH - 4))" "$msg"
+        fi
+        sleep 0.12
+        tick=$((tick + 1))
+    done
+
+    local rc=0
+    wait "$pid" || rc=$?
+    # Final drain.
+    _read_stream_chunk "$tmpout" out_pos "$filter"
+    _read_stream_chunk "$tmperr" err_pos "$filter"
+    (( can_render )) && clear_progress_line
+
+    rm -f "$tmpout" "$tmperr"
+    log "= $label rc=$rc duration=$((SECONDS - start))s"
+    return $rc
+}
+
+# =============================================================================
+#  LINE FILTERS  —  translate raw stdout into short student-facing status text.
+#  Each filter reads $1 (one line), sets $FILTER_OUT (empty = ignore line).
+# =============================================================================
+
+# pio platform install output: "Tool Manager: Installing ...", "Downloading X%".
+_RX_PIO_TOOL_INSTALL='Tool Manager: +Installing +[^/]+/([^ ]+) +@'
+_RX_PIO_TOOL_DONE='Tool Manager: +(.+) +@ +[^ ]+ +has been installed'
+_RX_PIO_DOWNLOAD='Downloading.*\[.*\] +([0-9]+%)'
+_RX_PIO_UNPACK='Unpacking.*\[.*\] +([0-9]+%)'
+_RX_PIO_PLAT_INSTALL='Platform Manager: +Installing +([^ ]+)'
+_RX_PIO_PLAT_DONE='Platform Manager: +.+ +@ +.+ +has been installed'
+
+format_pio_platform_line() {
+    local line=$1
+    FILTER_OUT=""
+    if   [[ "$line" =~ $_RX_PIO_TOOL_INSTALL ]]; then
+        FILTER_OUT="fetching ${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ $_RX_PIO_TOOL_DONE ]]; then
+        FILTER_OUT="installed ${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ $_RX_PIO_DOWNLOAD ]]; then
+        FILTER_OUT="downloading ${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ $_RX_PIO_UNPACK ]]; then
+        FILTER_OUT="unpacking ${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ $_RX_PIO_PLAT_INSTALL ]]; then
+        FILTER_OUT="platform ${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ $_RX_PIO_PLAT_DONE ]]; then
+        FILTER_OUT="platform installed"
+    fi
+}
+
+# pio pkg install output: "Library Manager: Installing X" — counter-aware.
+PIO_LIB_DONE=0
+PIO_LIB_TOTAL=0
+_RX_LIB_INSTALL='Library Manager: +Installing +(.+)$'
+_RX_LIB_CACHED='Library Manager: +(.+) +@ +[^ ]+ +is already installed'
+
+filter_pio_libs() {
+    local line=$1
+    FILTER_OUT=""
+    if [[ "$line" =~ $_RX_LIB_INSTALL ]]; then
+        PIO_LIB_DONE=$((PIO_LIB_DONE + 1))
+        (( PIO_LIB_DONE > PIO_LIB_TOTAL )) && PIO_LIB_DONE=$PIO_LIB_TOTAL
+        FILTER_OUT="[$PIO_LIB_DONE/$PIO_LIB_TOTAL] ${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ $_RX_LIB_CACHED ]]; then
+        PIO_LIB_DONE=$((PIO_LIB_DONE + 1))
+        (( PIO_LIB_DONE > PIO_LIB_TOTAL )) && PIO_LIB_DONE=$PIO_LIB_TOTAL
+        FILTER_OUT="[$PIO_LIB_DONE/$PIO_LIB_TOTAL] ${BASH_REMATCH[1]} (cached)"
+    fi
+}
+
+# `code --install-extension` output is sparse but emits "Installing extension",
+# "Extension X was successfully installed", and a few download lines.
+format_extension_line() {
+    local line=$1
+    FILTER_OUT=""
+    case "$line" in
+        *'Installing extensions'*)            FILTER_OUT='installing' ;;
+        *'Installing extension'*)             FILTER_OUT='installing' ;;
+        *'was successfully installed'*)       FILTER_OUT='installed' ;;
+        *'is already installed'*)             FILTER_OUT='already installed' ;;
+        *Downloading*)                        FILTER_OUT='downloading' ;;
+        *Verifying*)                          FILTER_OUT='verifying' ;;
+    esac
+}
+
+# Generic "show download progress" — useful for fetch_artifact wrappers that
+# pipe curl's progress meter through this.
+_RX_CURL_PCT='([0-9]+(\.[0-9]+)?)%[[:space:]]'
+format_curl_line() {
+    local line=$1
+    FILTER_OUT=""
+    if [[ "$line" =~ $_RX_CURL_PCT ]]; then
+        FILTER_OUT="downloading ${BASH_REMATCH[1]}%"
+    fi
+}
+
+# =============================================================================
 #  LOGGING HELPERS
 # =============================================================================
 
@@ -610,35 +867,61 @@ ensure_esp32_platform() {
         status REPAIR "Removing incomplete tool-esptoolpy package"
         rm -rf "$esptoolpy_dir"
     fi
-    if ( cd "$WORKSPACE" && "$PIO_BIN" platform list --json-output 2>/dev/null \
-            | grep -Fq "$PIO_PLATFORM_PIN" ); then
+    local pkgs_dir="$WORKSPACE/.pio-core/packages"
+    if [[ -d "$pkgs_dir" ]] && \
+        find "$pkgs_dir" -maxdepth 1 -type d -name 'toolchain-xtensa*' 2>/dev/null | grep -q .; then
         status SKIP "$PIO_PLATFORM_PIN already installed"
         return 0
     fi
-    status INSTALL "Downloading ESP32 toolchain (~500 MB) — 3–5 minutes, please wait..."
-    ( cd "$WORKSPACE" && run_cmd "pio platform install" -- "$PIO_BIN" platform install "$PIO_PLATFORM_PIN" ) \
-        || { status FAIL "ESP32 platform install failed"; return 1; }
-    status OK "ESP32 platform installed"
+    status INSTALL "Downloading ESP32 toolchain (~500 MB) — 3–5 minutes"
+    local rc=0
+    invoke_streamed 'pio platform install' '   downloading' format_pio_platform_line "$WORKSPACE" \
+        -- "$PIO_BIN" platform install "$PIO_PLATFORM_PIN" || rc=$?
+    # Verify by side-effect — the toolchain dir is the source of truth even if
+    # pio's exit code is ambiguous.
+    if [[ -d "$pkgs_dir" ]] && \
+        find "$pkgs_dir" -maxdepth 1 -type d -name 'toolchain-xtensa*' 2>/dev/null | grep -q .; then
+        status OK "ESP32 platform installed"
+        (( rc != 0 )) && log "note: pio platform rc=$rc but toolchain present on disk"
+        return 0
+    fi
+    status FAIL "ESP32 platform install failed (rc=$rc, no toolchain on disk)"
+    return 1
 }
 
 ensure_libraries() {
     [[ -f "$WORKSPACE/platformio.ini" ]] || { status FAIL "platformio.ini missing"; return 1; }
-    ( cd "$WORKSPACE" && run_cmd "pio pkg install" -- "$PIO_BIN" pkg install ) \
-        || { status FAIL "pio pkg install failed"; return 1; }
-    local lib missing=0
-    for lib in "${EXPECTED_LIBS[@]}"; do
-        # libdeps folder names mangle spaces to underscores or hyphens; do a
-        # tolerant match against the library's display name first token.
-        local pat="${lib%% *}"
-        if find "$WORKSPACE/.pio/libdeps" -mindepth 2 -maxdepth 3 -type d \
-                -iname "*${pat}*" 2>/dev/null | grep -q .; then
-            continue
-        fi
-        status FAIL "Library missing: $lib"
-        missing=$((missing + 1))
-    done
-    (( missing == 0 )) || return 1
-    status OK "Libraries installed: ${#EXPECTED_LIBS[@]}/${#EXPECTED_LIBS[@]}"
+    status INSTALL "Installing ${#EXPECTED_LIBS[@]} libraries"
+    PIO_LIB_TOTAL=${#EXPECTED_LIBS[@]}
+    PIO_LIB_DONE=0
+    local rc=0
+    invoke_streamed 'pio pkg install' '   libraries' filter_pio_libs "$WORKSPACE" \
+        -- "$PIO_BIN" pkg install || rc=$?
+
+    # Verify by side-effect, regardless of rc. Disk state is source of truth.
+    local libdeps="$WORKSPACE/.pio/libdeps"
+    local lib pat missing=()
+    if [[ -d "$libdeps" ]]; then
+        for lib in "${EXPECTED_LIBS[@]}"; do
+            pat="${lib%% *}"
+            if find "$libdeps" -mindepth 2 -maxdepth 3 -type d \
+                    -iname "*${pat}*" 2>/dev/null | grep -q .; then
+                continue
+            fi
+            missing+=("$lib")
+        done
+    fi
+    if [[ -d "$libdeps" && ${#missing[@]} -eq 0 ]]; then
+        status OK "All ${#EXPECTED_LIBS[@]} libraries installed"
+        (( rc != 0 )) && log "note: pio rc=$rc but all expected libraries present on disk"
+        return 0
+    fi
+    if [[ ! -d "$libdeps" ]]; then
+        status FAIL "pio pkg install failed (rc=$rc, libdeps directory missing)"
+    else
+        for lib in "${missing[@]}"; do status FAIL "Library missing: $lib"; done
+    fi
+    return 1
 }
 
 # =============================================================================
@@ -816,12 +1099,24 @@ ensure_vscode() {
 _install_vscode_mac() {
     local zip="$STATE_DIR/VSCode.zip"
     local internet="https://update.code.visualstudio.com/latest/darwin-universal/stable"
-    status INSTALL "Downloading VS Code"
-    fetch_artifact vscode "VSCode-darwin-universal.zip" "$internet" "$zip" \
-        || { status FAIL "VS Code download failed"; return 1; }
+    status INSTALL "Downloading VS Code (~150 MB)"
+    # fetch_artifact uses curl -fsS (silent). Wrap in invoke_streamed so the
+    # student sees the spinner advancing.
+    local rc=0
+    invoke_streamed 'vscode download' '   downloading' '' '' \
+        -- bash -c "set -e; rm -f '$zip'; curl -fL --max-time 600 -o '$zip' '$internet'" || rc=$?
+    if (( rc != 0 )) || [[ ! -s "$zip" ]]; then
+        status FAIL "VS Code download failed"; return 1
+    fi
     rm -rf "/Applications/Visual Studio Code.app"
-    run_cmd "unzip VSCode" -- unzip -q -o "$zip" -d /Applications/ \
-        || { status FAIL "VS Code unzip to /Applications failed (check disk space and admin access)"; return 1; }
+    status INSTALL "Unzipping VS Code into /Applications"
+    rc=0
+    invoke_streamed 'unzip VSCode' '   unzipping' '' '' \
+        -- unzip -q -o "$zip" -d /Applications/ || rc=$?
+    if (( rc != 0 )) || [[ ! -d "/Applications/Visual Studio Code.app" ]]; then
+        status FAIL "VS Code unzip to /Applications failed (check disk space and admin access)"
+        return 1
+    fi
     rm -f "$zip"
     _ensure_code_symlink_mac
     refresh_path
@@ -844,21 +1139,35 @@ _ensure_code_symlink_mac() {
 }
 
 _install_vscode_linux() {
-    local pkg
+    local pkg internet rc=0
     if command -v apt-get >/dev/null 2>&1; then
         pkg="$STATE_DIR/code.deb"
-        local internet="https://go.microsoft.com/fwlink/?LinkID=760868"
-        fetch_artifact vscode "code-amd64.deb" "$internet" "$pkg" \
-            || { status FAIL "VS Code .deb download failed"; return 1; }
-        run_cmd "apt install code" -- sudo apt-get install -y "$pkg" \
-            || { status FAIL "apt install failed"; return 1; }
+        internet="https://go.microsoft.com/fwlink/?LinkID=760868"
+        status INSTALL "Downloading VS Code (.deb)"
+        invoke_streamed 'vscode .deb download' '   downloading' '' '' \
+            -- bash -c "set -e; rm -f '$pkg'; curl -fL --max-time 600 -o '$pkg' '$internet'" || rc=$?
+        if (( rc != 0 )) || [[ ! -s "$pkg" ]]; then
+            status FAIL "VS Code .deb download failed"; return 1
+        fi
+        status INSTALL "Installing VS Code via apt"
+        rc=0
+        invoke_streamed 'apt install code' '   apt' '' '' \
+            -- sudo apt-get install -y "$pkg" || rc=$?
+        (( rc == 0 )) || { status FAIL "apt install failed (rc=$rc)"; return 1; }
     elif command -v dnf >/dev/null 2>&1; then
         pkg="$STATE_DIR/code.rpm"
-        local internet="https://packages.microsoft.com/yumrepos/vscode/code-1.x86_64.rpm"
-        fetch_artifact vscode "code-x86_64.rpm" "$internet" "$pkg" \
-            || { status FAIL "VS Code .rpm download failed"; return 1; }
-        run_cmd "dnf install code" -- sudo dnf install -y "$pkg" \
-            || { status FAIL "dnf install failed"; return 1; }
+        internet="https://packages.microsoft.com/yumrepos/vscode/code-1.x86_64.rpm"
+        status INSTALL "Downloading VS Code (.rpm)"
+        invoke_streamed 'vscode .rpm download' '   downloading' '' '' \
+            -- bash -c "set -e; rm -f '$pkg'; curl -fL --max-time 600 -o '$pkg' '$internet'" || rc=$?
+        if (( rc != 0 )) || [[ ! -s "$pkg" ]]; then
+            status FAIL "VS Code .rpm download failed"; return 1
+        fi
+        status INSTALL "Installing VS Code via dnf"
+        rc=0
+        invoke_streamed 'dnf install code' '   dnf' '' '' \
+            -- sudo dnf install -y "$pkg" || rc=$?
+        (( rc == 0 )) || { status FAIL "dnf install failed (rc=$rc)"; return 1; }
     else
         status FAIL "No supported Linux package manager (apt/dnf)"
         return 1
@@ -893,28 +1202,241 @@ ensure_udev_rule() {
 ensure_extensions() {
     command -v code >/dev/null 2>&1 || { status FAIL "code CLI not on PATH"; return 1; }
     local installed; installed=$(code --list-extensions 2>/dev/null | tr '[:upper:]' '[:lower:]')
-    local ext lc
+    local ext lc idx=0 total=${#VSCODE_EXTS[@]}
     for ext in "${VSCODE_EXTS[@]}"; do
+        idx=$((idx + 1))
         lc=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')
         if grep -qx "$lc" <<<"$installed"; then
-            status SKIP "ext $ext"
+            status SKIP "[$idx/$total] $ext (already installed)"
             continue
         fi
+        status INSTALL "[$idx/$total] $ext"
         _install_one_extension "$ext" || _install_one_extension "$ext" || \
             { status FAIL "ext $ext could not be installed"; continue; }
     done
+}
+
+# Source of truth for "is ext installed": ask code CLI directly.
+test_extension_installed() {
+    local ext=$1
+    local lc; lc=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')
+    local list; list=$(code --list-extensions 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    grep -qx "$lc" <<<"$list"
 }
 
 _install_one_extension() {
     local ext=$1
     local vsix="$STATE_DIR/$ext.vsix"
     if [[ -n "$MIRROR_BASE" ]] && mirror_url_for vsix "$ext.vsix" >/dev/null 2>&1; then
-        fetch_artifact vsix "$ext.vsix" "" "$vsix" \
-            && run_cmd "ext install $ext (vsix)" -- code --install-extension "$vsix" \
-            && status OK "ext $ext" && return 0
+        if fetch_artifact vsix "$ext.vsix" "" "$vsix"; then
+            invoke_streamed "ext install $ext (vsix)" "   $ext" format_extension_line '' \
+                -- code --install-extension "$vsix" || true
+            if test_extension_installed "$ext"; then status OK "ext $ext"; return 0; fi
+        fi
     fi
-    run_cmd "ext install $ext (marketplace)" -- code --install-extension "$ext" \
-        && status OK "ext $ext"
+    invoke_streamed "ext install $ext (marketplace)" "   $ext" format_extension_line '' \
+        -- code --install-extension "$ext" || true
+    if test_extension_installed "$ext"; then status OK "ext $ext"; return 0; fi
+    return 1
+}
+
+# =============================================================================
+#  PARALLEL LIBS + EXTENSIONS  —  pio pkg install runs in background, code
+#  --install-extension calls are serialised (code CLI doesn't parallelise
+#  safely). Both pipelines share one render loop with a single status line.
+# =============================================================================
+
+invoke_parallel_libs_and_extensions() {
+    [[ -f "$WORKSPACE/platformio.ini" ]] || { status FAIL 'platformio.ini missing'; ensure_extensions; return 1; }
+    [[ -x "$PIO_BIN" ]] || { status FAIL 'PlatformIO missing — skipping library install'; ensure_extensions; return 1; }
+    command -v code >/dev/null 2>&1 || { ensure_libraries; ensure_extensions; return; }
+
+    local lib_total=${#EXPECTED_LIBS[@]}
+    local ext_total=${#VSCODE_EXTS[@]}
+    PIO_LIB_TOTAL=$lib_total
+    PIO_LIB_DONE=0
+
+    status INSTALL "Installing $lib_total libraries + $ext_total VS Code extensions in parallel"
+
+    # Pre-list installed extensions so we skip ones already present.
+    local installed_lc; installed_lc=$(code --list-extensions 2>/dev/null | tr '[:upper:]' '[:lower:]')
+
+    local lib_out lib_err
+    lib_out=$(mktemp -t 'tdcs.libout.XXXXXX')
+    lib_err=$(mktemp -t 'tdcs.liberr.XXXXXX')
+    log "+ pio pkg install (parallel)"
+    ( cd "$WORKSPACE" && PYTHONUNBUFFERED=1 "$PIO_BIN" pkg install ) >"$lib_out" 2>"$lib_err" &
+    local lib_pid=$!
+
+    # State for ext pipeline.
+    local ext_queue=("${VSCODE_EXTS[@]}")
+    local ext_idx=0
+    local ext_cur=""
+    local ext_pid=0
+    local ext_out="" ext_err=""
+    local ext_out_pos=0 ext_err_pos=0
+
+    # Per-extension result lookup. Bash 3.2 has no associative arrays, so we
+    # keep two parallel arrays and look up by linear scan (n=3, irrelevant).
+    EXT_RESULT_KEYS=()
+    EXT_RESULT_VALS=()
+    _set_ext_result() {
+        local k=$1 v=$2 i
+        for i in "${!EXT_RESULT_KEYS[@]}"; do
+            if [[ "${EXT_RESULT_KEYS[$i]}" == "$k" ]]; then EXT_RESULT_VALS[$i]="$v"; return; fi
+        done
+        EXT_RESULT_KEYS+=("$k"); EXT_RESULT_VALS+=("$v")
+    }
+    _get_ext_result() {
+        local k=$1 i
+        for i in "${!EXT_RESULT_KEYS[@]}"; do
+            if [[ "${EXT_RESULT_KEYS[$i]}" == "$k" ]]; then printf '%s' "${EXT_RESULT_VALS[$i]}"; return; fi
+        done
+    }
+
+    EXT_STATUS=""
+    LIB_STATUS="starting"
+
+    _start_next_ext() {
+        # Advance through the queue; sets ext_cur, ext_pid, ext_out/err, ext_out_pos/err_pos.
+        # On a cached skip, marks result + leaves ext_pid=0 so the loop progresses.
+        ext_cur=""; ext_pid=0; ext_out=""; ext_err=""; ext_out_pos=0; ext_err_pos=0
+        (( ext_idx >= ${#VSCODE_EXTS[@]} )) && return 0
+        ext_cur="${ext_queue[$ext_idx]}"
+        ext_idx=$((ext_idx + 1))
+        local lc; lc=$(printf '%s' "$ext_cur" | tr '[:upper:]' '[:lower:]')
+        if grep -qx "$lc" <<<"$installed_lc"; then
+            _set_ext_result "$ext_cur" 'skip'
+            EXT_STATUS="[$ext_idx/$ext_total] $ext_cur (cached)"
+            return 0
+        fi
+        ext_out=$(mktemp -t 'tdcs.extout.XXXXXX')
+        ext_err=$(mktemp -t 'tdcs.exterr.XXXXXX')
+        EXT_STATUS="[$ext_idx/$ext_total] $ext_cur"
+        log "+ ext install $ext_cur (parallel)"
+        code --install-extension "$ext_cur" >"$ext_out" 2>"$ext_err" &
+        ext_pid=$!
+    }
+    _start_next_ext
+
+    local lib_out_pos=0 lib_err_pos=0 tick=0
+    local can_render=1
+    [[ -t 1 && -z "${NO_SPINNER:-}" ]] || can_render=0
+
+    while true; do
+        # Lib polling.
+        FILTER_OUT=""
+        _read_stream_chunk "$lib_out" lib_out_pos filter_pio_libs
+        [[ -n "$_LAST_STATUS" ]] && LIB_STATUS="$_LAST_STATUS"
+        _read_stream_chunk "$lib_err" lib_err_pos filter_pio_libs
+        [[ -n "$_LAST_STATUS" ]] && LIB_STATUS="$_LAST_STATUS"
+
+        # Ext polling (only when we have a live ext process).
+        if (( ext_pid > 0 )) && kill -0 "$ext_pid" 2>/dev/null; then
+            _LAST_STATUS=""
+            _read_stream_chunk "$ext_out" ext_out_pos format_extension_line
+            [[ -n "$_LAST_STATUS" ]] && EXT_STATUS="[$ext_idx/$ext_total] $ext_cur · $_LAST_STATUS"
+            _read_stream_chunk "$ext_err" ext_err_pos format_extension_line
+            [[ -n "$_LAST_STATUS" ]] && EXT_STATUS="[$ext_idx/$ext_total] $ext_cur · $_LAST_STATUS"
+        fi
+
+        # Current ext finished (or was cached) — advance.
+        local ext_ready=0
+        if [[ -z "$ext_cur" ]]; then
+            ext_ready=1
+        elif (( ext_pid == 0 )); then
+            ext_ready=1  # cached skip
+        elif ! kill -0 "$ext_pid" 2>/dev/null; then
+            ext_ready=1
+        fi
+        if (( ext_ready )) && [[ -n "$ext_cur" ]]; then
+            if (( ext_pid > 0 )); then
+                local ext_rc=0
+                wait "$ext_pid" 2>/dev/null || ext_rc=$?
+                # Final ext drain.
+                _LAST_STATUS=""
+                _read_stream_chunk "$ext_out" ext_out_pos format_extension_line
+                _read_stream_chunk "$ext_err" ext_err_pos format_extension_line
+                if (( ext_rc == 0 )); then
+                    _set_ext_result "$ext_cur" 'ok'
+                else
+                    _set_ext_result "$ext_cur" 'fail'
+                fi
+                rm -f "$ext_out" "$ext_err"
+            fi
+            _start_next_ext
+        fi
+
+        # Render.
+        if (( can_render )); then
+            local frame line
+            frame=$(spin_frame "$tick")
+            line="  $frame Libs: $LIB_STATUS  │  Exts: $EXT_STATUS"
+            if (( ${#line} > PROGRESS_CLEAR_WIDTH - 2 )); then
+                line="${line:0:$((PROGRESS_CLEAR_WIDTH - 5))}..."
+            fi
+            printf '\r%-*s' "$PROGRESS_CLEAR_WIDTH" "$line"
+        fi
+
+        # Exit when both pipelines are done.
+        local lib_done=0 ext_done=0
+        kill -0 "$lib_pid" 2>/dev/null || lib_done=1
+        if (( ext_idx >= ${#VSCODE_EXTS[@]} )) && [[ -z "$ext_cur" ]]; then ext_done=1; fi
+        if (( lib_done && ext_done )); then break; fi
+        sleep 0.12
+        tick=$((tick + 1))
+    done
+
+    local lib_rc=0
+    wait "$lib_pid" 2>/dev/null || lib_rc=$?
+    # Final lib drain.
+    _LAST_STATUS=""
+    _read_stream_chunk "$lib_out" lib_out_pos filter_pio_libs
+    _read_stream_chunk "$lib_err" lib_err_pos filter_pio_libs
+    (( can_render )) && clear_progress_line
+    rm -f "$lib_out" "$lib_err"
+    log "= pio pkg install (parallel) rc=$lib_rc"
+
+    # Library verification by filesystem.
+    local libdeps="$WORKSPACE/.pio/libdeps"
+    local lib pat missing=()
+    if [[ -d "$libdeps" ]]; then
+        for lib in "${EXPECTED_LIBS[@]}"; do
+            pat="${lib%% *}"
+            if find "$libdeps" -mindepth 2 -maxdepth 3 -type d -iname "*${pat}*" 2>/dev/null | grep -q .; then
+                continue
+            fi
+            missing+=("$lib")
+        done
+    fi
+    if [[ -d "$libdeps" && ${#missing[@]} -eq 0 ]]; then
+        status OK "All $lib_total libraries installed"
+        (( lib_rc != 0 )) && log "note: pio rc=$lib_rc but all expected libraries present on disk"
+    else
+        if [[ ! -d "$libdeps" ]]; then
+            status FAIL "pio pkg install failed (rc=$lib_rc, libdeps directory missing)"
+        else
+            for lib in "${missing[@]}"; do status FAIL "Library missing: $lib"; done
+        fi
+    fi
+
+    # Extension verification via code --list-extensions (authoritative).
+    local final_lc; final_lc=$(code --list-extensions 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    local ext lc r
+    for ext in "${VSCODE_EXTS[@]}"; do
+        lc=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')
+        if grep -qx "$lc" <<<"$final_lc"; then
+            r=$(_get_ext_result "$ext")
+            if [[ "$r" == 'skip' ]]; then
+                status SKIP "ext $ext (already installed)"
+            else
+                status OK "ext $ext"
+            fi
+            continue
+        fi
+        status WARN "ext $ext not present after parallel run — retrying"
+        _install_one_extension "$ext" || status FAIL "ext $ext could not be installed"
+    done
 }
 
 # =============================================================================
@@ -1209,37 +1731,120 @@ detect_setup_mode() {
     fi
 }
 
+show_first_run_plan() {
+    printf '\n'
+    if [[ -n "${C_MAGENTA:-}" ]]; then
+        printf '  %sFirst-time setup — here is what will happen:%s\n' "$C_BOLD" "$C_RESET"
+        printf '  %s(about 10–15 minutes on a fast network)%s\n' "$C_DIM" "$C_RESET"
+    else
+        printf '  First-time setup — here is what will happen:\n'
+        printf '  (about 10-15 minutes on a fast network)\n'
+    fi
+    # n, title, eta, blurb
+    local rows=(
+        '1|Preflight|~10s|check internet, disk, clock'
+        '2|Python toolchain|1-2 min|install uv + Python 3.11'
+        '3|Workspace|30-60s|clone class content, create .venv, install PlatformIO'
+        '4|ESP32 platform|3-5 min|download 500 MB toolchain'
+        '5|VS Code|1-2 min|install VS Code (if missing)'
+        '6|Libraries + extensions|1-2 min|parallel: 6 Arduino libs + 3 VS Code extensions'
+        '7|Smoke test|30s|verify the toolchain compiles a tiny sketch'
+    )
+    local row n t e b
+    for row in "${rows[@]}"; do
+        IFS='|' read -r n t e b <<<"$row"
+        if [[ -n "${C_MAGENTA:-}" ]]; then
+            printf '    %s%s.%s %s%-26s%s %s%-10s%s %s%s%s\n' \
+                "$C_MAGENTA" "$n" "$C_RESET" \
+                "$C_BOLD" "$t" "$C_RESET" \
+                "$C_YELLOW" "$e" "$C_RESET" \
+                "$C_DIM" "$b" "$C_RESET"
+        else
+            printf '    %s. %-26s %-10s %s\n' "$n" "$t" "$e" "$b"
+        fi
+    done
+    printf '\n'
+}
+
 run_setup_mode() {
     case "$1" in
         first_run)
-            status INFO "First run — installing everything (10–15 minutes)"
+            show_first_run_plan
+
+            write_phase 'Preflight' 1 7
             discover_mirror
+
+            write_phase 'Python toolchain' 2 7
             ensure_uv
+            if ! command -v uv >/dev/null 2>&1; then
+                status FAIL "uv missing — halting install (rest of phases would only echo this)"
+                stop_phase
+                write_final_summary
+                open_vscode_if_safe
+                return
+            fi
             ensure_python
+
+            write_phase 'Workspace' 3 7
             ensure_upstream
             sync_workspace
             seed_student_code_if_empty
             ensure_venv
             ensure_platformio
             ensure_pio_on_path
-            ensure_esp32_platform
-            ensure_libraries
+            local pio_ready=0
+            [[ -x "$PIO_BIN" ]] && pio_ready=1
+            if (( ! pio_ready )); then
+                status FAIL "PlatformIO missing — skipping ESP32 platform, libraries, and smoke test"
+            fi
+
+            write_phase 'ESP32 platform (~500 MB)' 4 7
+            local esp32_ready=0
+            if (( pio_ready )); then
+                ensure_esp32_platform || true
+                local pkgs_dir="$WORKSPACE/.pio-core/packages"
+                if [[ -d "$pkgs_dir" ]] && \
+                    find "$pkgs_dir" -maxdepth 1 -type d -name 'toolchain-xtensa*' 2>/dev/null | grep -q .; then
+                    esp32_ready=1
+                fi
+            else
+                status SKIP 'ESP32 platform (PIO unavailable)'
+            fi
+
+            write_phase 'VS Code' 5 7
             ensure_vscode
-            ensure_extensions
+
+            write_phase 'Libraries + extensions (parallel)' 6 7
+            if (( pio_ready )); then
+                invoke_parallel_libs_and_extensions
+            else
+                status SKIP 'Libraries (PIO unavailable)'
+                ensure_extensions
+            fi
             ensure_udev_rule
-            run_smoke_test || true
+
+            write_phase 'Smoke test' 7 7
+            if (( pio_ready && esp32_ready )); then
+                run_smoke_test || true
+            else
+                status SKIP 'Smoke test (PIO/ESP32 toolchain unavailable)'
+            fi
+            stop_phase
             ;;
         daily)
+            write_phase 'Daily sync'
             ensure_upstream
             sync_workspace
             seed_student_code_if_empty
             print_port_guidance
+            stop_phase
             ;;
         repair)
-            status INFO "Repairing environment"
+            write_phase 'Repair'
             ensure_upstream
             sync_workspace
             run_all_health_checks || true
+            stop_phase
             ;;
         *) status FAIL "Unknown mode: $1"; return 1 ;;
     esac
@@ -1305,15 +1910,18 @@ write_final_summary() {
 }
 
 configure_vscode_user_settings() {
-    # Disable workspace trust prompts (controlled lab) and point PIO extension at
-    # our venv so it works regardless of how VS Code was opened.
+    # User-level keys are kept narrow on purpose: only things that MUST take
+    # effect before any workspace has loaded (trust dialog, chat panel that
+    # autostarts globally, PIO Home auto-popup on extension activation,
+    # startup walkthrough). Editor / window restoration is workspace-scoped
+    # and lives in setup/.vscode/settings.json instead.
     local user_dir
     case "$OS" in
         mac)   user_dir="$HOME/Library/Application Support/Code/User" ;;
         linux) user_dir="$HOME/.config/Code/User" ;;
         *)     return 0 ;;
     esac
-    [[ -d "$user_dir" ]] || return 0
+    mkdir -p "$user_dir"
     local f="$user_dir/settings.json"
     local venv_bin="$VENV_DIR/bin"
     "$PYTHON_BIN" -c "
@@ -1324,11 +1932,82 @@ try:
         obj = json.load(fh)
 except Exception:
     obj = {}
-obj['security.workspace.trust.enabled'] = False
-obj['platformio-ide.customPATH'] = venv_bin
+keys = {
+    # Trust / startup chrome.
+    'security.workspace.trust.enabled': False,
+    'workbench.startupEditor': 'none',
+    'workbench.welcomePage.walkthroughs.openOnInstall': False,
+    'workbench.tips.enabled': False,
+    'update.showReleaseNotes': False,
+    'extensions.ignoreRecommendations': True,
+    # Chat / auxiliary side bar — the built-in Chat extension auto-shows its
+    # view regardless of which workspace is open, so suppression must be
+    # user-level.
+    'workbench.secondarySideBar.visible': False,
+    'workbench.auxiliaryBar.visible': False,
+    'chat.commandCenter.enabled': False,
+    'chat.editor.enabled': False,
+    'chat.experimental.offerSetup': False,
+    'chat.setupFromDialog': False,
+    'chat.welcomeView.enabled': False,
+    # PlatformIO — PIO Home pops up on first activation before workspace
+    # settings load, so user-level is the only reliable place to disable it.
+    'platformio-ide.customPATH': venv_bin,
+    'platformio-ide.disablePIOHomeStartup': True,
+    'platformio-ide.activateOnlyOnPlatformIOProject': True,
+    'platformio-ide.autoOpenPlatformIOIniFile': False,
+    'platformio-ide.useBuiltinPIOCore': False,
+}
+obj.update(keys)
 with open(f, 'w') as fh:
     json.dump(obj, fh, indent=2)
 " "$f" "$venv_bin" 2>/dev/null || true
+}
+
+# VS Code per-workspace layout state (incl. auxiliary-bar visibility) lives in
+# ~/.../Code/User/workspaceStorage/<md5-of-file-uri>/. Reset on first_run so the
+# chat panel doesn't restore from a previous session. Daily/repair runs leave
+# state alone so students keep editor tabs / breakpoints.
+reset_vscode_aux_bar_state() {
+    local base
+    case "$OS" in
+        mac)   base="$HOME/Library/Application Support/Code/User/workspaceStorage" ;;
+        linux) base="$HOME/.config/Code/User/workspaceStorage" ;;
+        *)     return 0 ;;
+    esac
+    [[ -d "$base" ]] || return 0
+    local uri="file://$WORKSPACE"
+    local hash
+    if command -v md5 >/dev/null 2>&1; then
+        hash=$(printf '%s' "$uri" | md5)
+    elif command -v md5sum >/dev/null 2>&1; then
+        hash=$(printf '%s' "$uri" | md5sum | awk '{print $1}')
+    else
+        return 0
+    fi
+    local dir="$base/$hash"
+    if [[ -d "$dir" ]]; then
+        rm -rf "$dir" 2>/dev/null && log "Reset VS Code workspace state: $dir" \
+            || log "Could not reset VS Code workspace state at $dir"
+    fi
+}
+
+# Probe whether `code --help` advertises a given flag. Cached per-flag via files
+# under $STATE_DIR so we don't spawn code --help repeatedly.
+test_code_flag_supported() {
+    local flag=$1
+    local cache_dir="$STATE_DIR/code-flags"
+    local safe_flag="${flag//[^a-zA-Z0-9]/_}"
+    local cache_file="$cache_dir/$safe_flag"
+    if [[ -f "$cache_file" ]]; then
+        [[ "$(cat "$cache_file")" == "1" ]]
+        return $?
+    fi
+    mkdir -p "$cache_dir"
+    if code --help 2>/dev/null | grep -qF -- "$flag"; then
+        printf '1' > "$cache_file"; return 0
+    fi
+    printf '0' > "$cache_file"; return 1
 }
 
 open_vscode_if_safe() {
@@ -1340,15 +2019,21 @@ open_vscode_if_safe() {
     fi
 
     configure_vscode_user_settings
+    # Clear prior workspace layout state only on first_run so the chat aux bar
+    # doesn't restore. On daily/repair we trust the user-level settings.
+    [[ "$MODE" == "first_run" ]] && reset_vscode_aux_bar_state
 
     # Open as single-root folder so PIO's workspaceContains:platformio.ini
-    # activation fires correctly. (.code-workspace multi-root mode prevents PIO
-    # from auto-activating and showing the bottom toolbar.)
+    # activation fires correctly. Only main.cpp opens — no QUICKSTART.md, no
+    # restored tabs (workspace settings cover that).
     local -a code_args=("$WORKSPACE")
-    [[ "$MODE" == "first_run" ]] && code_args+=("$WORKSPACE/QUICKSTART.md")
     [[ -f "$STUDENT_CODE_DIR/main.cpp" ]] && code_args+=("$STUDENT_CODE_DIR/main.cpp")
+    # Newer VS Code (1.94+) supports --disable-chat-setup; older builds error.
+    if test_code_flag_supported '--disable-chat-setup'; then
+        code_args=('--disable-chat-setup' "${code_args[@]}")
+    fi
     if code "${code_args[@]}" 2>/dev/null; then
-        status OK "Opened workspace"
+        status OK "Opened VS Code"
     else
         status WARN "VS Code did not open — run manually: code $WORKSPACE"
     fi
