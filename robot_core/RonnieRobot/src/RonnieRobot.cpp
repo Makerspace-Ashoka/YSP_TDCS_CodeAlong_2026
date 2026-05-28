@@ -12,6 +12,12 @@ volatile bool stopRequested   = false;
 bool          runRequested    = false;
 bool          sequenceRunning = false;   // true only while mySequence() is on the stack
 
+// Hidden REPL helper: `pose <name>` runs a built-in pose under the same
+// sequenceRunning/stopRequested machinery as `run`. Not advertised in the
+// banner; intended for hand-driving during calibration / pose authoring.
+typedef void (*PoseFn)();
+PoseFn poseRequested = nullptr;
+
 constexpr size_t kLineBufMax = 64;
 char    lineBuf[kLineBufMax + 1];
 size_t  lineLen        = 0;
@@ -130,7 +136,10 @@ void cmdServo(const char* arg) {
   if (clamped > r.max) { clamped = r.max; didClamp = true; }
 
   // Bypass the sequenceRunning gate — REPL hand-driving isn't a sequence write.
-  pca.setPWM(uint8_t(servo), 0, angleToPulse(clamped));
+  // Apply invert here so the REPL behaves identically to setServo() in code,
+  // i.e. `servo R1 60` produces the same physical pose as setServo(R1, 60).
+  const int driven = SERVO_INVERT[servo] ? (180 - clamped) : clamped;
+  pca.setPWM(uint8_t(servo), 0, angleToPulse(driven));
 
   if (didClamp) {
     Serial.print(F("! "));
@@ -183,6 +192,48 @@ void cmdI2c() {
   }
 }
 
+struct PoseEntry { const char* name; PoseFn fn; };
+const PoseEntry POSES[] = {
+  {"stand",  stand},  {"rest",   rest},   {"wave",   wave},   {"dance",  dance},
+  {"swim",   swim},   {"point",  point},  {"pushup", pushup}, {"bow",    bow},
+  {"cute",   cute},   {"freaky", freaky}, {"worm",   worm},   {"shake",  shake},
+  {"shrug",  shrug},  {"dead",   dead},   {"crab",   crab},
+};
+constexpr size_t POSE_COUNT = sizeof(POSES) / sizeof(POSES[0]);
+
+void cmdPose(const char* arg) {
+  const char* nameStart = arg;
+  const char* p = nameStart;
+  while (*p && *p != ' ' && *p != '\t') p++;
+  size_t nameLen = size_t(p - nameStart);
+  while (*p == ' ' || *p == '\t') p++;
+  if (nameLen == 0 || *p != '\0') {
+    Serial.println(F("? usage: pose <name>"));
+    return;
+  }
+  for (size_t i = 0; i < POSE_COUNT; i++) {
+    const char* pn = POSES[i].name;
+    size_t pl = 0;
+    while (pn[pl]) pl++;
+    if (pl != nameLen) continue;
+    bool match = true;
+    for (size_t k = 0; k < pl; k++) {
+      if (toLowerAscii(nameStart[k]) != pn[k]) { match = false; break; }
+    }
+    if (match) {
+      if (sequenceRunning) {
+        Serial.println(F("? sequence already running — type 'stop' first"));
+        return;
+      }
+      poseRequested = POSES[i].fn;
+      return;
+    }
+  }
+  Serial.print(F("? unknown pose \""));
+  for (size_t i = 0; i < nameLen; i++) Serial.print(nameStart[i]);
+  Serial.println(F("\""));
+}
+
 void processLine(const char* line) {
   while (*line == ' ' || *line == '\t') line++;
   if (*line == '\0') return;
@@ -194,6 +245,7 @@ void processLine(const char* line) {
   if (matchExact(line, "i2c"))  { cmdI2c();             return; }
 
   if (const char* arg = matchKeyword(line, "servo")) { cmdServo(arg); return; }
+  if (const char* arg = matchKeyword(line, "pose"))  { cmdPose(arg);  return; }
 
   Serial.print(F("? unknown command \""));
   Serial.print(line);
@@ -263,14 +315,24 @@ void knees(int angle) {
 
 }  // namespace
 
+// Angle conventions in cmd space (after SERVO_INVERT is applied in setServo):
+//   hips: 90 = neutral, lower → leg swings forward (toward head), higher → backward.
+//   safe intersection for hips() helper: [60, 115] (limited by R1 max and R2 min).
+//   knees: 90 = neutral, range [10, 170] for all four knees.
+//
+// pushup/shrug/worm intentionally target the knees() helper; front and back knees
+// have opposite physical mountings, so the same cmd produces opposing physical
+// motion (back foot up vs front knee down). The motion still respects every
+// servo's calibrated range — the asymmetric look is a wiring quirk, not a bug.
+
 void stand() { hips(90);  knees(90); }
 void rest()  { stand(); }
 
 void wave() {
-  setServo(R4, 30);  wait(250);
-  setServo(R4, 120); wait(250);
-  setServo(R4, 30);  wait(250);
-  setServo(R4, 90);  wait(150);
+  setServo(R1, 50);  wait(250);
+  setServo(R1, 110); wait(250);
+  setServo(R1, 50);  wait(250);
+  setServo(R1, 90);  wait(150);
 }
 
 void dance() {
@@ -283,16 +345,16 @@ void dance() {
 
 void swim() {
   for (int i = 0; i < 3; i++) {
-    setServo(R1, 60);  setServo(L1, 120); wait(220);
-    setServo(R1, 120); setServo(L1, 60);  wait(220);
+    setServo(R1, 60);  setServo(L1, 115); wait(220);
+    setServo(R1, 110); setServo(L1, 60);  wait(220);
   }
   stand();
 }
 
 void point() {
-  setServo(R4, 30);
+  setServo(R1, 50);
   wait(800);
-  setServo(R4, 90);
+  setServo(R1, 90);
 }
 
 void pushup() {
@@ -315,7 +377,7 @@ void cute() {
 void freaky() {
   for (int i = 0; i < 5; i++) {
     allTo(60);  wait(80);
-    allTo(120); wait(80);
+    allTo(115); wait(80);
   }
   stand();
 }
@@ -323,7 +385,7 @@ void freaky() {
 void worm() {
   hips(60);   wait(200);
   knees(60);  wait(200);
-  hips(120);  wait(200);
+  hips(115);  wait(200);
   knees(120); wait(200);
   stand();
 }
@@ -337,11 +399,11 @@ void shake() {
 }
 
 void shrug() { knees(70); wait(400); stand(); }
-void dead()  { allTo(40); wait(900); stand(); }
+void dead()  { allTo(60); wait(900); stand(); }
 
 void crab() {
-  setServo(R1, 60);  setServo(R4, 60);
-  setServo(L1, 120); setServo(L3, 120);
+  setServo(R1, 60);  setServo(R2, 60);
+  setServo(L1, 120); setServo(L2, 120);
   wait(700);
   stand();
 }
@@ -365,6 +427,21 @@ void loop() {
     Serial.println(F("→ running... (type 'stop' to interrupt)"));
     sequenceRunning = true;
     mySequence();
+    sequenceRunning = false;
+    if (stopRequested) {
+      stopRequested = false;
+      rest();
+      Serial.println(F("→ stopped"));
+    } else {
+      Serial.println(F("→ done"));
+    }
+  }
+  if (poseRequested) {
+    PoseFn fn = poseRequested;
+    poseRequested = nullptr;
+    stopRequested = false;
+    sequenceRunning = true;
+    fn();
     sequenceRunning = false;
     if (stopRequested) {
       stopRequested = false;
