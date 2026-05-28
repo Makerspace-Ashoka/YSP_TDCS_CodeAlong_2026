@@ -796,8 +796,18 @@ function Ensure-Esp32Platform {
         -WorkingDir $Script:Workspace `
         -StatusPrefix '   downloading' `
         -LineFilter { param($line) Format-PioPlatformLine $line }
-    if ($rc -ne 0) { Write-Status FAIL 'ESP32 platform install failed'; return }
-    Write-Status OK 'ESP32 platform installed'
+    # Verify by side-effect: toolchain-xtensa* under .pio-core/packages.
+    # The exit code from a streamed Start-Process can race with HasExited on
+    # Windows PS 5.1 and read as $null; the disk is the source of truth.
+    $toolchainOk = (Test-Path $pkgsDir) -and (
+        @(Get-ChildItem $pkgsDir -Directory -Filter 'toolchain-xtensa*' -ErrorAction SilentlyContinue).Count -gt 0
+    )
+    if ($toolchainOk) {
+        Write-Status OK 'ESP32 platform installed'
+        if ($rc -ne 0) { Write-Log "note: pio platform rc=$rc but toolchain present on disk" }
+    } else {
+        Write-Status FAIL "ESP32 platform install failed (rc=$rc, no toolchain on disk)"
+    }
 }
 
 # Translate raw PIO platform install lines into short student-facing tags.
@@ -864,24 +874,36 @@ function Invoke-StreamedCommand {
         return 1
     }
 
-    $outPos = 0; $errPos = 0; $tick = 0; $lastStatus = ''
+    $state = @{
+        OutPath = $tmpOut.FullName; ErrPath = $tmpErr.FullName
+        OutPos  = 0;                ErrPos  = 0
+    }
+    $tick = 0; $lastStatus = ''
     while (-not $proc.HasExited) {
-        $lastStatus = (Read-StreamProgress -OutPath $tmpOut.FullName -ErrPath $tmpErr.FullName `
-            -OutPosRef ([ref]$outPos) -ErrPosRef ([ref]$errPos) `
-            -LineFilter $LineFilter -LastStatus $lastStatus)
+        $lastStatus = Read-StreamProgress -State $state `
+            -LineFilter $LineFilter -LastStatus $lastStatus
         $frame = Get-SpinFrame -Tick $tick
         $msg = if ($lastStatus) { "$StatusPrefix · $lastStatus" } else { $StatusPrefix }
         Write-Host ("`r  {0} {1}" -f $frame, $msg).PadRight($Script:ProgressClearWidth) -NoNewline
         Start-Sleep -Milliseconds 120
         $tick++
     }
+    # Wait for the kernel to fully reap the process. Without this, $proc.ExitCode
+    # races with HasExited on Windows PowerShell 5.1 and can return $null, which
+    # silently becomes "not zero" (since $null -ne 0 is true) → false FAIL.
+    try { $proc.WaitForExit() } catch { }
+
     # Drain remaining buffered output.
-    $null = Read-StreamProgress -OutPath $tmpOut.FullName -ErrPath $tmpErr.FullName `
-        -OutPosRef ([ref]$outPos) -ErrPosRef ([ref]$errPos) `
-        -LineFilter $LineFilter -LastStatus $lastStatus
+    $null = Read-StreamProgress -State $state -LineFilter $LineFilter -LastStatus $lastStatus
     Clear-ProgressLine
 
     $rc = $proc.ExitCode
+    if ($null -eq $rc) {
+        # Treat as 0; downstream verifications (libdeps presence, toolchain dir,
+        # code --list-extensions) are the authoritative check.
+        Write-Log "= $Label WARN: ExitCode unreadable after WaitForExit; treating as 0 and deferring to side-effect check"
+        $rc = 0
+    }
     Remove-Item -Path $tmpOut.FullName, $tmpErr.FullName -ErrorAction SilentlyContinue
     $duration = [int]((Get-Date) - $start).TotalSeconds
     Write-Log "= $Label rc=$rc duration=${duration}s"
@@ -891,30 +913,31 @@ function Invoke-StreamedCommand {
 # Read newly-appended lines from the stdout/stderr files since last poll, send them
 # to the script log, and return the most recent non-empty status (from $LineFilter
 # or the raw last line) for in-place rendering.
+#
+# $State is a hashtable: { OutPath, ErrPath, OutPos, ErrPos }. We mutate OutPos /
+# ErrPos directly — hashtables are reference-typed in PS, so the mutations
+# propagate back to the caller. (An earlier version used [ref]$h.Member, which
+# silently doesn't propagate, causing every poll to re-read the whole file.)
 function Read-StreamProgress {
     param(
-        [Parameter(Mandatory)][string]$OutPath,
-        [Parameter(Mandatory)][string]$ErrPath,
-        [Parameter(Mandatory)][ref]$OutPosRef,
-        [Parameter(Mandatory)][ref]$ErrPosRef,
+        [Parameter(Mandatory)][hashtable]$State,
         [scriptblock]$LineFilter,
         [string]$LastStatus
     )
     $status = $LastStatus
-    foreach ($pair in @(@($OutPath, $OutPosRef), @($ErrPath, $ErrPosRef))) {
-        $path = $pair[0]; $posRef = $pair[1]
-        if (-not (Test-Path $path)) { continue }
+    foreach ($which in @('Out','Err')) {
+        $path   = $State["${which}Path"]
+        $posKey = "${which}Pos"
+        if (-not $path -or -not (Test-Path $path)) { continue }
         try { $size = (Get-Item $path).Length } catch { continue }
-        if ($size -le $posRef.Value) { continue }
+        if ($size -le $State[$posKey]) { continue }
         $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
         try {
-            $null = $fs.Seek($posRef.Value, 'Begin')
+            $null = $fs.Seek($State[$posKey], 'Begin')
             $sr = New-Object System.IO.StreamReader($fs)
-            try {
-                $chunk = $sr.ReadToEnd()
-            } finally { $sr.Dispose() }
+            try { $chunk = $sr.ReadToEnd() } finally { $sr.Dispose() }
         } finally { $fs.Dispose() }
-        $posRef.Value = $size
+        $State[$posKey] = $size
         foreach ($raw in $chunk -split "(`r`n|`r|`n)") {
             $line = ($raw -replace '\x1b\[[0-9;]*[A-Za-z]','').Trim()
             if (-not $line) { continue }
@@ -952,18 +975,28 @@ function Ensure-Libraries {
             }
             return $null
         }
-    if ($rc -ne 0) { Write-Status FAIL 'pio pkg install failed'; return }
-
+    # Verify by side-effect, regardless of pio's reported rc — the streamed
+    # ExitCode can race on Windows PS 5.1. Disk state is the source of truth.
     $libdeps = Join-Path $Script:Workspace '.pio\libdeps'
-    if (-not (Test-Path $libdeps)) { Write-Status FAIL 'libdeps directory missing'; return }
-    $missing = 0
-    foreach ($lib in $Script:ExpectedLibs) {
-        $pat = ($lib -split ' ')[0]
-        $found = Get-ChildItem -Path $libdeps -Directory -Recurse -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like "*$pat*" }
-        if (-not $found) { Write-Status FAIL "Library missing: $lib"; $missing++ }
+    $missing = @()
+    if (Test-Path $libdeps) {
+        foreach ($lib in $Script:ExpectedLibs) {
+            $pat = ($lib -split ' ')[0]
+            $found = Get-ChildItem -Path $libdeps -Directory -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "*$pat*" }
+            if (-not $found) { $missing += $lib }
+        }
     }
-    if ($missing -eq 0) { Write-Status OK "All $total libraries installed" }
+    if ((Test-Path $libdeps) -and $missing.Count -eq 0) {
+        Write-Status OK "All $total libraries installed"
+        if ($rc -ne 0) { Write-Log "note: pio rc=$rc but all expected libraries present on disk" }
+    } else {
+        if (-not (Test-Path $libdeps)) {
+            Write-Status FAIL "pio pkg install failed (rc=$rc, libdeps directory missing)"
+        } else {
+            foreach ($lib in $missing) { Write-Status FAIL "Library missing: $lib" }
+        }
+    }
 }
 
 # =============================================================================
@@ -1206,17 +1239,26 @@ function Install-OneExtension {
     if ($entry -and $entry.Url) {
         $vsix = Join-Path $Script:StateDir "$Ext.vsix"
         if (Fetch-Artifact 'vsix' "$Ext.vsix" $null $vsix) {
-            $rc = Invoke-StreamedCommand -Label "ext install $Ext (vsix)" -Command 'code' `
+            $null = Invoke-StreamedCommand -Label "ext install $Ext (vsix)" -Command 'code' `
                 -ArgumentList @('--install-extension',$vsix) `
                 -StatusPrefix "   $Ext" -LineFilter { param($l) Format-ExtensionLine $l }
-            if ($rc -eq 0) { Write-Status OK "ext $Ext"; return $true }
+            if (Test-ExtensionInstalled $Ext) { Write-Status OK "ext $Ext"; return $true }
         }
     }
-    $rc = Invoke-StreamedCommand -Label "ext install $Ext (marketplace)" -Command 'code' `
+    $null = Invoke-StreamedCommand -Label "ext install $Ext (marketplace)" -Command 'code' `
         -ArgumentList @('--install-extension',$Ext) `
         -StatusPrefix "   $Ext" -LineFilter { param($l) Format-ExtensionLine $l }
-    if ($rc -eq 0) { Write-Status OK "ext $Ext"; return $true }
+    if (Test-ExtensionInstalled $Ext) { Write-Status OK "ext $Ext"; return $true }
     return $false
+}
+
+# Source of truth for "is this extension installed": ask the code CLI directly.
+# Avoids relying on the streamed-process ExitCode race.
+function Test-ExtensionInstalled {
+    param([string]$Ext)
+    $list = & code --list-extensions 2>$null
+    if (-not $list) { return $false }
+    return ($list | Where-Object { $_ -and ($_.ToLower() -eq $Ext.ToLower()) }) -ne $null
 }
 
 function Format-ExtensionLine {
@@ -1255,24 +1297,19 @@ function Invoke-ParallelLibsAndExtensions {
         Ensure-Libraries; Ensure-Extensions; return
     }
 
+    $libOut = New-TemporaryFile; $libErr = New-TemporaryFile
     $S = @{
         LibTotal   = $Script:ExpectedLibs.Count
         LibDone    = 0
-        LibOut     = (New-TemporaryFile)
-        LibErr     = (New-TemporaryFile)
-        LibOutPos  = 0
-        LibErrPos  = 0
         LibStatus  = 'starting'
+        LibState   = @{ OutPath = $libOut.FullName; ErrPath = $libErr.FullName; OutPos = 0; ErrPos = 0 }
 
         ExtTotal   = $Script:VscodeExts.Count
         ExtQueue   = [System.Collections.Queue]::new()
         ExtIdx     = 0
         ExtCur     = $null
         ExtProc    = $null
-        ExtOut     = $null
-        ExtErr     = $null
-        ExtOutPos  = 0
-        ExtErrPos  = 0
+        ExtState   = $null   # set per-extension launch
         ExtStatus  = 'queued'
         ExtResults = @{}
         ExtInstalled = @{}
@@ -1289,11 +1326,11 @@ function Invoke-ParallelLibsAndExtensions {
     try {
         $libProc = Start-Process -FilePath $Script:PioBin -ArgumentList @('pkg','install') `
             -WorkingDirectory $Script:Workspace -NoNewWindow -PassThru `
-            -RedirectStandardOutput $S.LibOut.FullName -RedirectStandardError $S.LibErr.FullName
+            -RedirectStandardOutput $S.LibState.OutPath -RedirectStandardError $S.LibState.ErrPath
     } catch {
         Write-Log "pio launch failed: $_"
         Write-Status FAIL "pio pkg install could not launch: $($_.Exception.Message)"
-        Remove-Item $S.LibOut.FullName, $S.LibErr.FullName -ErrorAction SilentlyContinue
+        Remove-Item $S.LibState.OutPath, $S.LibState.ErrPath -ErrorAction SilentlyContinue
         # Fall back to sequential extension install so we still finish the phase.
         Ensure-Extensions
         return
@@ -1309,22 +1346,23 @@ function Invoke-ParallelLibsAndExtensions {
             $S.ExtProc = $null
             return
         }
-        $S.ExtOut = New-TemporaryFile; $S.ExtErr = New-TemporaryFile
-        $S.ExtOutPos = 0; $S.ExtErrPos = 0
+        $eo = New-TemporaryFile; $ee = New-TemporaryFile
+        $S.ExtState = @{ OutPath = $eo.FullName; ErrPath = $ee.FullName; OutPos = 0; ErrPos = 0 }
         $S.ExtStatus = ("[{0}/{1}] {2}" -f $S.ExtIdx, $S.ExtTotal, $S.ExtCur)
         Write-Log "+ ext install $($S.ExtCur) (parallel)"
         try {
             $S.ExtProc = Start-Process -FilePath 'code' `
                 -ArgumentList @('--install-extension', $S.ExtCur) `
                 -NoNewWindow -PassThru `
-                -RedirectStandardOutput $S.ExtOut.FullName `
-                -RedirectStandardError  $S.ExtErr.FullName
+                -RedirectStandardOutput $S.ExtState.OutPath `
+                -RedirectStandardError  $S.ExtState.ErrPath
         } catch {
             Write-Log "code launch failed for $($S.ExtCur): $_"
             $S.ExtResults[$S.ExtCur] = 'fail'
             $S.ExtStatus = ("[{0}/{1}] {2} (launch failed)" -f $S.ExtIdx, $S.ExtTotal, $S.ExtCur)
-            Remove-Item $S.ExtOut.FullName, $S.ExtErr.FullName -ErrorAction SilentlyContinue
-            $S.ExtProc = $null
+            Remove-Item $S.ExtState.OutPath, $S.ExtState.ErrPath -ErrorAction SilentlyContinue
+            $S.ExtState = $null
+            $S.ExtProc  = $null
         }
     }
 
@@ -1352,14 +1390,12 @@ function Invoke-ParallelLibsAndExtensions {
     $tick = 0
     while ($true) {
         # Lib polling.
-        $S.LibStatus = Read-StreamProgress -OutPath $S.LibOut.FullName -ErrPath $S.LibErr.FullName `
-            -OutPosRef ([ref]$S.LibOutPos) -ErrPosRef ([ref]$S.LibErrPos) `
+        $S.LibStatus = Read-StreamProgress -State $S.LibState `
             -LastStatus $S.LibStatus -LineFilter $libLineFilter
 
         # Ext polling (only when a real process is running).
-        if ($S.ExtProc -and -not $S.ExtProc.HasExited) {
-            $S.ExtStatus = Read-StreamProgress -OutPath $S.ExtOut.FullName -ErrPath $S.ExtErr.FullName `
-                -OutPosRef ([ref]$S.ExtOutPos) -ErrPosRef ([ref]$S.ExtErrPos) `
+        if ($S.ExtProc -and -not $S.ExtProc.HasExited -and $S.ExtState) {
+            $S.ExtStatus = Read-StreamProgress -State $S.ExtState `
                 -LastStatus $S.ExtStatus -LineFilter $extLineFilter
         }
 
@@ -1367,13 +1403,20 @@ function Invoke-ParallelLibsAndExtensions {
         $extReady = (-not $S.ExtProc) -or $S.ExtProc.HasExited
         if ($extReady -and $S.ExtCur) {
             if ($S.ExtProc) {
-                $null = Read-StreamProgress -OutPath $S.ExtOut.FullName -ErrPath $S.ExtErr.FullName `
-                    -OutPosRef ([ref]$S.ExtOutPos) -ErrPosRef ([ref]$S.ExtErrPos) `
-                    -LastStatus $S.ExtStatus -LineFilter $extLineFilter
-                $S.ExtResults[$S.ExtCur] = if ($S.ExtProc.ExitCode -eq 0) { 'ok' } else { 'fail' }
-                Remove-Item $S.ExtOut.FullName, $S.ExtErr.FullName -ErrorAction SilentlyContinue
+                # Wait for full reap so ExitCode is reliable on Windows PS 5.1.
+                try { $S.ExtProc.WaitForExit() } catch { }
+                if ($S.ExtState) {
+                    $null = Read-StreamProgress -State $S.ExtState `
+                        -LastStatus $S.ExtStatus -LineFilter $extLineFilter
+                }
+                $extRc = $S.ExtProc.ExitCode
+                if ($null -eq $extRc) { $extRc = 0 }  # defer to side-effect check
+                $S.ExtResults[$S.ExtCur] = if ($extRc -eq 0) { 'ok' } else { 'fail' }
+                if ($S.ExtState) {
+                    Remove-Item $S.ExtState.OutPath, $S.ExtState.ErrPath -ErrorAction SilentlyContinue
+                }
             }
-            $S.ExtCur = $null; $S.ExtProc = $null
+            $S.ExtCur = $null; $S.ExtProc = $null; $S.ExtState = $null
             & $startNextExt
         }
 
@@ -1391,45 +1434,59 @@ function Invoke-ParallelLibsAndExtensions {
         Start-Sleep -Milliseconds 120
         $tick++
     }
-    # Final drain.
-    $null = Read-StreamProgress -OutPath $S.LibOut.FullName -ErrPath $S.LibErr.FullName `
-        -OutPosRef ([ref]$S.LibOutPos) -ErrPosRef ([ref]$S.LibErrPos) -LastStatus $S.LibStatus
+    # Wait for full reap so libProc.ExitCode is reliable on Windows PS 5.1.
+    try { $libProc.WaitForExit() } catch { }
+
+    # Final drain of pio output.
+    $null = Read-StreamProgress -State $S.LibState -LastStatus $S.LibStatus
     Clear-ProgressLine
 
     $libRc = $libProc.ExitCode
-    Remove-Item $S.LibOut.FullName, $S.LibErr.FullName -ErrorAction SilentlyContinue
+    if ($null -eq $libRc) { $libRc = 0 }  # defer to side-effect check
+    Remove-Item $S.LibState.OutPath, $S.LibState.ErrPath -ErrorAction SilentlyContinue
     Write-Log "= pio pkg install (parallel) rc=$libRc"
 
-    # Report library results.
-    if ($libRc -ne 0) {
-        Write-Status FAIL 'pio pkg install failed'
+    # Library results — verify by filesystem first. ExitCode is a hint, not the
+    # source of truth (it raced with HasExited on Win PS 5.1 in earlier builds
+    # and falsely flagged every library as failed).
+    $libdeps = Join-Path $Script:Workspace '.pio\libdeps'
+    $missing = @()
+    if (Test-Path $libdeps) {
+        foreach ($lib in $Script:ExpectedLibs) {
+            $pat = ($lib -split ' ')[0]
+            $found = Get-ChildItem -Path $libdeps -Directory -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "*$pat*" }
+            if (-not $found) { $missing += $lib }
+        }
+    }
+    if ((Test-Path $libdeps) -and $missing.Count -eq 0) {
+        Write-Status OK "All $($S.LibTotal) libraries installed"
+        if ($libRc -ne 0) { Write-Log "note: pio rc=$libRc but all expected libraries present on disk" }
     } else {
-        $libdeps = Join-Path $Script:Workspace '.pio\libdeps'
         if (-not (Test-Path $libdeps)) {
-            Write-Status FAIL 'libdeps directory missing'
+            Write-Status FAIL "pio pkg install failed (rc=$libRc, libdeps directory missing)"
         } else {
-            $missing = 0
-            foreach ($lib in $Script:ExpectedLibs) {
-                $pat = ($lib -split ' ')[0]
-                $found = Get-ChildItem -Path $libdeps -Directory -Recurse -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -like "*$pat*" }
-                if (-not $found) { Write-Status FAIL "Library missing: $lib"; $missing++ }
-            }
-            if ($missing -eq 0) { Write-Status OK "All $($S.LibTotal) libraries installed" }
+            foreach ($lib in $missing) { Write-Status FAIL "Library missing: $lib" }
         }
     }
 
-    # Report extension results (with sequential fallback on failure).
+    # Extension results — verify against `code --list-extensions` regardless of
+    # the parallel runner's per-ext exit code reading.
+    $finalInstalled = @{}
+    (& code --list-extensions 2>$null) | ForEach-Object {
+        if ($_) { $finalInstalled[$_.ToLower()] = $true }
+    }
     foreach ($ext in $Script:VscodeExts) {
-        $r = $S.ExtResults[$ext]
-        switch ($r) {
-            'ok'   { Write-Status OK   "ext $ext" }
-            'skip' { Write-Status SKIP "ext $ext (already installed)" }
-            'fail' {
-                Write-Status WARN "ext $ext failed in parallel run — retrying"
-                if (-not (Install-OneExtension $ext)) { Write-Status FAIL "ext $ext could not be installed" }
-            }
-            default { Write-Status FAIL "ext ${ext}: no result (queue error)" }
+        if ($finalInstalled.ContainsKey($ext.ToLower())) {
+            $tag = $S.ExtResults[$ext]
+            if ($tag -eq 'skip') { Write-Status SKIP "ext $ext (already installed)" }
+            else                 { Write-Status OK   "ext $ext" }
+            continue
+        }
+        # Not present in code's final list — actually missing. Retry sequentially.
+        Write-Status WARN "ext $ext not present after parallel run — retrying"
+        if (-not (Install-OneExtension $ext)) {
+            Write-Status FAIL "ext $ext could not be installed"
         }
     }
 }
