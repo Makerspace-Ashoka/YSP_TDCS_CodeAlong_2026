@@ -100,7 +100,7 @@ void cmdServo(const char* arg) {
   if (!lookupServo(nameStart, nameLen, servo)) {
     Serial.print(F("? unknown servo \""));
     for (size_t i = 0; i < nameLen; i++) Serial.print(nameStart[i]);
-    Serial.println(F("\" — try: R1 R2 L1 L2 R3 R4 L3 L4"));
+    Serial.println(F("\" — try: L1 L2 L3 L4 R1 R2 R3 R4"));
     return;
   }
 
@@ -231,7 +231,8 @@ void setServo(ServoName servo, int angle) {
   const ServoRange r = SERVO_RANGES[servo];
   if (angle < r.min) angle = r.min;
   if (angle > r.max) angle = r.max;
-  pca.setPWM(uint8_t(servo), 0, angleToPulse(angle));
+  const int driven = SERVO_INVERT[servo] ? (180 - angle) : angle;
+  pca.setPWM(uint8_t(servo), 0, angleToPulse(driven));
 }
 
 void wait(unsigned long ms) {
@@ -252,12 +253,12 @@ void allTo(int angle) {
   for (uint8_t ch = 0; ch < SERVO_COUNT; ch++) setServo(ServoName(ch), angle);
 }
 void hips(int angle) {
-  setServo(R1, angle); setServo(L1, angle);
-  setServo(R4, angle); setServo(L3, angle);
+  setServo(L1, angle); setServo(L2, angle);
+  setServo(R1, angle); setServo(R2, angle);
 }
 void knees(int angle) {
-  setServo(R2, angle); setServo(R3, angle);
-  setServo(L2, angle); setServo(L4, angle);
+  setServo(L3, angle); setServo(L4, angle);
+  setServo(R3, angle); setServo(R4, angle);
 }
 
 }  // namespace

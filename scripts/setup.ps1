@@ -1931,27 +1931,33 @@ function Configure-VsCodeUserSettings {
     [System.IO.File]::WriteAllText($f, ($obj | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
 }
 
-# Returns the workspace-storage folder VS Code uses for our workspace, or $null.
-# VS Code hashes the workspace URI (file:///C:/Users/.../YSP_TDCS_Makerspace) with
-# MD5 and stores per-workspace layout state (including auxiliary-bar visibility)
-# under %APPDATA%/Code/User/workspaceStorage/<hash>/.
+# Find the workspace-storage folder VS Code uses for our workspace by scanning
+# %APPDATA%/Code/User/workspaceStorage/* for the subdir whose workspace.json
+# records our folder URI. We can't compute the hash directly — VS Code uses
+# md5(folderUri.fsPath + birthtime/inode salt), and bash/PS can't reliably
+# reproduce that salt. The workspace.json file is the authoritative pointer.
 function Get-VsCodeWorkspaceStorageDir {
     $base = Join-Path $env:APPDATA 'Code\User\workspaceStorage'
     if (-not (Test-Path $base)) { return $null }
-    # Build the file URI VS Code uses (forward slashes, lower-case drive letter).
     $abs = (Resolve-Path $Script:Workspace -ErrorAction SilentlyContinue).Path
     if (-not $abs) { return $null }
+    # VS Code writes the folder URI with forward slashes and a lower-case drive
+    # letter on Windows; build the same form so we can string-match.
     $uri = 'file:///' + ($abs -replace '\\','/')
     if ($uri -match '^(file:///)([A-Za-z]):') {
         $uri = "$($matches[1])$($matches[2].ToLower()):" + $uri.Substring($matches[0].Length)
     }
-    $md5 = [System.Security.Cryptography.MD5]::Create()
-    try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($uri)
-        $hash  = ($md5.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join ''
-    } finally { $md5.Dispose() }
-    $dir = Join-Path $base $hash
-    if (Test-Path $dir) { return $dir }
+    foreach ($d in Get-ChildItem -Path $base -Directory -ErrorAction SilentlyContinue) {
+        $wsJson = Join-Path $d.FullName 'workspace.json'
+        if (-not (Test-Path $wsJson)) { continue }
+        try {
+            $obj = Get-Content $wsJson -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        } catch { continue }
+        if ($obj -and $obj.PSObject.Properties.Match('folder').Count -gt 0 -and
+            $obj.folder -ieq $uri) {
+            return $d.FullName
+        }
+    }
     return $null
 }
 
@@ -1961,10 +1967,10 @@ function Get-VsCodeWorkspaceStorageDir {
 function Reset-VsCodeAuxBarState {
     $dir = Get-VsCodeWorkspaceStorageDir
     if (-not $dir) { return }
-    # The auxiliary bar visibility lives inside state.vscdb (SQLite); we don't
-    # ship sqlite3 on Windows. Removing the whole workspace-storage dir is safe:
-    # VS Code rebuilds it on next launch with the values from user/workspace
-    # settings, which now insist on a hidden aux bar.
+    # Layout state (incl. aux-bar visibility) lives inside state.vscdb (SQLite).
+    # We don't ship sqlite3 on Windows, so we remove the whole workspace-storage
+    # dir. VS Code rebuilds it on next launch with the values from user/workspace
+    # settings, which insist on a hidden aux bar.
     try {
         Remove-Item -Path $dir -Recurse -Force -ErrorAction Stop
         Write-Log "Reset VS Code workspace state: $dir"
