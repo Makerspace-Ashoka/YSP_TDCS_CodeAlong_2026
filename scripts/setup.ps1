@@ -111,6 +111,8 @@ $Script:CountFail      = 0
 $Script:FailedSteps    = @()
 $Script:UseColor       = $false
 $Script:CurrentLog     = $null
+$Script:CurrentPhase   = $null
+$Script:PhaseStart     = $null
 
 # =============================================================================
 #  CONSOLE HELPERS  —  color, banner, status lines, spinner.
@@ -173,6 +175,67 @@ function Write-Status {
         Write-Host "[$Tag] $text"
     }
     Write-Log "[$Tag] $text"
+}
+
+# Braille spinner frames — smooth 10-frame cycle. Falls back to ascii when no color.
+$Script:SpinFrames     = @('⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏')
+$Script:SpinFramesAsc  = @('-','\','|','/')
+function Get-SpinFrame {
+    param([int]$Tick)
+    if ($Script:UseColor) {
+        return $Script:SpinFrames[$Tick % $Script:SpinFrames.Count]
+    }
+    return $Script:SpinFramesAsc[$Tick % $Script:SpinFramesAsc.Count]
+}
+
+# Width to clear when overwriting a progress line in place.
+$Script:ProgressClearWidth = 110
+
+function Clear-ProgressLine {
+    Write-Host ("`r" + (' ' * $Script:ProgressClearWidth) + "`r") -NoNewline
+}
+
+function Write-Phase {
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [int]$Step = 0,
+        [int]$Total = 0
+    )
+    if ($Script:CurrentPhase) { Stop-Phase }
+    $displayTitle = if ($Step -gt 0 -and $Total -gt 0) {
+        "Step $Step/$Total · $Title"
+    } else {
+        $Title
+    }
+    $Script:CurrentPhase = $displayTitle
+    $Script:PhaseStart   = Get-Date
+    Write-Host ''
+    if ($Script:UseColor) {
+        Write-Host ('┌─ ') -ForegroundColor Magenta -NoNewline
+        if ($Step -gt 0 -and $Total -gt 0) {
+            Write-Host ("Step $Step/$Total") -ForegroundColor Yellow   -NoNewline
+            Write-Host ' · '                 -ForegroundColor DarkGray -NoNewline
+            Write-Host $Title                -ForegroundColor White
+        } else {
+            Write-Host $Title -ForegroundColor White
+        }
+    } else {
+        Write-Host "== $displayTitle =="
+    }
+    Write-Log "=== PHASE START: $displayTitle ==="
+}
+
+function Stop-Phase {
+    if (-not $Script:CurrentPhase) { return }
+    $elapsed = [int]((Get-Date) - $Script:PhaseStart).TotalSeconds
+    if ($Script:UseColor) {
+        Write-Host ('└─ ') -ForegroundColor Magenta -NoNewline
+        Write-Host ("{0} · {1}s" -f $Script:CurrentPhase, $elapsed) -ForegroundColor DarkGray
+    } else {
+        Write-Host ("-- $($Script:CurrentPhase) · ${elapsed}s --")
+    }
+    Write-Log "=== PHASE END: $Script:CurrentPhase elapsed=${elapsed}s ==="
+    $Script:CurrentPhase = $null
 }
 
 # =============================================================================
@@ -543,19 +606,20 @@ function Get-MirrorEntry {
     param([string]$Category, [string]$Name)
     if (-not $Script:MirrorBase) { return $null }
     if (-not (Test-Path $Script:MirrorManifest)) { return $null }
-    Get-Content $Script:MirrorManifest -Raw |
-        ForEach-Object {
-            $matches = [regex]::Matches(
-                $_,
-                '\{"category":"' + [regex]::Escape($Category) + '","name":"' + [regex]::Escape($Name) + '"[^}]+\}'
-            )
-            if ($matches.Count -gt 0) {
-                $entry = $matches[0].Value
-                $url = ([regex]::Match($entry, '"url":"([^"]+)"')).Groups[1].Value
-                $sha = ([regex]::Match($entry, '"sha256":"([^"]+)"')).Groups[1].Value
-                return [pscustomobject]@{ Url = $url; Sha256 = $sha }
-            }
-        }
+    # Manifest schema: { "generated_at": ..., "artifacts": [ {category, name, url, sha256, size}, ... ] }
+    $doc = $null
+    try {
+        $doc = Get-Content $Script:MirrorManifest -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Write-Log "mirror manifest parse failed: $_"
+        return $null
+    }
+    if (-not $doc.artifacts) { return $null }
+    $entry = $doc.artifacts | Where-Object {
+        $_.category -eq $Category -and $_.name -eq $Name
+    } | Select-Object -First 1
+    if (-not $entry) { return $null }
+    return [pscustomobject]@{ Url = $entry.url; Sha256 = $entry.sha256 }
 }
 
 function Get-Sha256 {
@@ -725,42 +789,170 @@ function Ensure-Esp32Platform {
         Write-Status SKIP "$($Script:PioPlatformPin) already installed"
         return
     }
-    Write-Status INSTALL 'Downloading ESP32 toolchain (~500 MB) — 3-5 minutes, please wait...'
-    $rc = Invoke-LoggedCommand -Label 'pio platform install' -Command $Script:PioBin `
+    Write-Status INSTALL 'Downloading ESP32 toolchain (~500 MB) — 3-5 minutes'
+    $rc = Invoke-StreamedCommand -Label 'pio platform install' `
+        -Command $Script:PioBin `
         -ArgumentList @('platform','install',$Script:PioPlatformPin) `
-        -WorkingDir $Script:Workspace
+        -WorkingDir $Script:Workspace `
+        -StatusPrefix '   downloading' `
+        -LineFilter { param($line) Format-PioPlatformLine $line }
     if ($rc -ne 0) { Write-Status FAIL 'ESP32 platform install failed'; return }
     Write-Status OK 'ESP32 platform installed'
+}
+
+# Translate raw PIO platform install lines into short student-facing tags.
+function Format-PioPlatformLine {
+    param([string]$Line)
+    if (-not $Line) { return $null }
+    # PlatformIO prints lines like:
+    #   Tool Manager: Installing platformio/framework-arduinoespressif32 @ ...
+    #   Downloading  [####                  ]  32%  00:01:23
+    #   Unpacking  [####################################]  100%
+    if ($Line -match 'Tool Manager:\s+Installing\s+\S+/(\S+)\s+@') {
+        return "fetching $($matches[1])"
+    }
+    if ($Line -match 'Tool Manager:\s+(.+?)\s+@\s+\S+\s+has been installed!') {
+        return "installed $($matches[1])"
+    }
+    if ($Line -match 'Downloading.*?\[.*?\]\s+(\d+%)') {
+        return "downloading $($matches[1])"
+    }
+    if ($Line -match 'Unpacking.*?\[.*?\]\s+(\d+%)') {
+        return "unpacking $($matches[1])"
+    }
+    if ($Line -match 'Platform Manager:\s+Installing\s+(\S+)') {
+        return "platform $($matches[1])"
+    }
+    if ($Line -match 'Platform Manager:\s+(.+?)\s+@\s+\S+\s+has been installed') {
+        return "platform installed"
+    }
+    return $null
+}
+
+# Run an external command, tail its stdout/stderr in real time, redact + log every
+# line, and surface a short progress label (returned by $LineFilter) on a single
+# in-place status line. Returns the process exit code, or 1 on launch failure.
+function Invoke-StreamedCommand {
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][string]$Command,
+        [string[]]$ArgumentList = @(),
+        [string]$WorkingDir = $null,
+        [string]$StatusPrefix = '  working',
+        [scriptblock]$LineFilter = $null
+    )
+    $sanitized = ConvertTo-Redacted "$Command $($ArgumentList -join ' ')"
+    Write-Log "+ $Label`: $sanitized"
+    $start  = Get-Date
+    $tmpOut = New-TemporaryFile
+    $tmpErr = New-TemporaryFile
+
+    $params = @{
+        FilePath               = $Command
+        ArgumentList           = $ArgumentList
+        NoNewWindow            = $true
+        PassThru               = $true
+        RedirectStandardOutput = $tmpOut.FullName
+        RedirectStandardError  = $tmpErr.FullName
+    }
+    if ($WorkingDir) { $params.WorkingDirectory = $WorkingDir }
+
+    $proc = $null
+    try { $proc = Start-Process @params } catch {
+        Add-Content -Path $Script:CurrentLog -Value "EXCEPTION: $_" -Encoding utf8
+        Remove-Item -Path $tmpOut.FullName, $tmpErr.FullName -ErrorAction SilentlyContinue
+        return 1
+    }
+
+    $outPos = 0; $errPos = 0; $tick = 0; $lastStatus = ''
+    while (-not $proc.HasExited) {
+        $lastStatus = (Read-StreamProgress -OutPath $tmpOut.FullName -ErrPath $tmpErr.FullName `
+            -OutPosRef ([ref]$outPos) -ErrPosRef ([ref]$errPos) `
+            -LineFilter $LineFilter -LastStatus $lastStatus)
+        $frame = Get-SpinFrame -Tick $tick
+        $msg = if ($lastStatus) { "$StatusPrefix · $lastStatus" } else { $StatusPrefix }
+        Write-Host ("`r  {0} {1}" -f $frame, $msg).PadRight($Script:ProgressClearWidth) -NoNewline
+        Start-Sleep -Milliseconds 120
+        $tick++
+    }
+    # Drain remaining buffered output.
+    $null = Read-StreamProgress -OutPath $tmpOut.FullName -ErrPath $tmpErr.FullName `
+        -OutPosRef ([ref]$outPos) -ErrPosRef ([ref]$errPos) `
+        -LineFilter $LineFilter -LastStatus $lastStatus
+    Clear-ProgressLine
+
+    $rc = $proc.ExitCode
+    Remove-Item -Path $tmpOut.FullName, $tmpErr.FullName -ErrorAction SilentlyContinue
+    $duration = [int]((Get-Date) - $start).TotalSeconds
+    Write-Log "= $Label rc=$rc duration=${duration}s"
+    return $rc
+}
+
+# Read newly-appended lines from the stdout/stderr files since last poll, send them
+# to the script log, and return the most recent non-empty status (from $LineFilter
+# or the raw last line) for in-place rendering.
+function Read-StreamProgress {
+    param(
+        [Parameter(Mandatory)][string]$OutPath,
+        [Parameter(Mandatory)][string]$ErrPath,
+        [Parameter(Mandatory)][ref]$OutPosRef,
+        [Parameter(Mandatory)][ref]$ErrPosRef,
+        [scriptblock]$LineFilter,
+        [string]$LastStatus
+    )
+    $status = $LastStatus
+    foreach ($pair in @(@($OutPath, $OutPosRef), @($ErrPath, $ErrPosRef))) {
+        $path = $pair[0]; $posRef = $pair[1]
+        if (-not (Test-Path $path)) { continue }
+        try { $size = (Get-Item $path).Length } catch { continue }
+        if ($size -le $posRef.Value) { continue }
+        $fs = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+        try {
+            $null = $fs.Seek($posRef.Value, 'Begin')
+            $sr = New-Object System.IO.StreamReader($fs)
+            try {
+                $chunk = $sr.ReadToEnd()
+            } finally { $sr.Dispose() }
+        } finally { $fs.Dispose() }
+        $posRef.Value = $size
+        foreach ($raw in $chunk -split "(`r`n|`r|`n)") {
+            $line = ($raw -replace '\x1b\[[0-9;]*[A-Za-z]','').Trim()
+            if (-not $line) { continue }
+            Add-Content -Path $Script:CurrentLog -Value $line -Encoding utf8
+            $cooked = if ($LineFilter) { & $LineFilter $line } else { $line }
+            if ($cooked) {
+                $status = ($cooked -as [string])
+                if ($status.Length -gt 80) { $status = $status.Substring(0,77) + '...' }
+            }
+        }
+    }
+    return $status
 }
 
 function Ensure-Libraries {
     if (-not (Test-Path (Join-Path $Script:Workspace 'platformio.ini'))) {
         Write-Status FAIL 'platformio.ini missing'; return
     }
-    Write-Status INSTALL "Installing $($Script:ExpectedLibs.Count) libraries (2-5 min):"
-    foreach ($lib in $Script:ExpectedLibs) { Write-Status INFO "  · $lib" }
+    Write-Status INSTALL "Installing $($Script:ExpectedLibs.Count) libraries"
 
-    # Run pio pkg install in background so a live spinner shows it isn't frozen.
-    $tmpOut = New-TemporaryFile; $tmpErr = New-TemporaryFile
-    $proc = Start-Process -FilePath $Script:PioBin `
-        -ArgumentList @('pkg', 'install') `
-        -WorkingDirectory $Script:Workspace `
-        -NoNewWindow -PassThru `
-        -RedirectStandardOutput $tmpOut.FullName `
-        -RedirectStandardError  $tmpErr.FullName
-    $chars = '-\|/'
-    $i = 0
-    while (-not $proc.HasExited) {
-        Write-Host ("`r  [{0}] Downloading from registry..." -f $chars[$i % 4]) -NoNewline
-        $i++; Start-Sleep -Milliseconds 250
-    }
-    Write-Host "`r  Done.                                " # clear spinner line
-
-    Get-Content $tmpOut.FullName, $tmpErr.FullName -ErrorAction SilentlyContinue |
-        ForEach-Object { Write-Log $_ }
-    Remove-Item $tmpOut.FullName, $tmpErr.FullName -ErrorAction SilentlyContinue
-
-    if ($proc.ExitCode -ne 0) { Write-Status FAIL 'pio pkg install failed'; return }
+    $total = $Script:ExpectedLibs.Count
+    $script:libCounter = 0
+    $rc = Invoke-StreamedCommand -Label 'pio pkg install' -Command $Script:PioBin `
+        -ArgumentList @('pkg','install') -WorkingDir $Script:Workspace `
+        -StatusPrefix '   libraries' `
+        -LineFilter {
+            param($line)
+            if ($line -match 'Library Manager:\s+Installing\s+(.+)$') {
+                $script:libCounter = [Math]::Min($script:libCounter + 1, $total)
+                return ("[{0}/{1}] {2}" -f $script:libCounter, $total, $matches[1].Trim())
+            }
+            if ($line -match 'Library Manager:\s+(.+?)\s+@\s+\S+\s+is already installed') {
+                $script:libCounter = [Math]::Min($script:libCounter + 1, $total)
+                return ("[{0}/{1}] {2} (cached)" -f $script:libCounter, $total, $matches[1].Trim())
+            }
+            return $null
+        }
+    if ($rc -ne 0) { Write-Status FAIL 'pio pkg install failed'; return }
 
     $libdeps = Join-Path $Script:Workspace '.pio\libdeps'
     if (-not (Test-Path $libdeps)) { Write-Status FAIL 'libdeps directory missing'; return }
@@ -769,9 +961,9 @@ function Ensure-Libraries {
         $pat = ($lib -split ' ')[0]
         $found = Get-ChildItem -Path $libdeps -Directory -Recurse -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -like "*$pat*" }
-        if ($found) { Write-Status OK "  $lib" } else { Write-Status FAIL "Library missing: $lib"; $missing++ }
+        if (-not $found) { Write-Status FAIL "Library missing: $lib"; $missing++ }
     }
-    if ($missing -eq 0) { Write-Status OK "All $($Script:ExpectedLibs.Count) libraries installed" }
+    if ($missing -eq 0) { Write-Status OK "All $total libraries installed" }
 }
 
 # =============================================================================
@@ -993,11 +1185,15 @@ function Ensure-Extensions {
         Write-Status FAIL 'code CLI not on PATH'; return
     }
     $installed = (& code --list-extensions 2>$null) | ForEach-Object { $_.ToLower() }
+    $idx = 0
+    $total = $Script:VscodeExts.Count
     foreach ($ext in $Script:VscodeExts) {
+        $idx++
         if ($installed -contains $ext.ToLower()) {
-            Write-Status SKIP "ext $ext"; continue
+            Write-Status SKIP ("[{0}/{1}] {2} (already installed)" -f $idx, $total, $ext)
+            continue
         }
-        Write-Status INSTALL "ext $ext — downloading from marketplace..."
+        Write-Status INSTALL ("[{0}/{1}] {2}" -f $idx, $total, $ext)
         $ok = Install-OneExtension $ext
         if (-not $ok) { $ok = Install-OneExtension $ext }
         if (-not $ok) { Write-Status FAIL "ext $ext could not be installed" }
@@ -1010,15 +1206,232 @@ function Install-OneExtension {
     if ($entry -and $entry.Url) {
         $vsix = Join-Path $Script:StateDir "$Ext.vsix"
         if (Fetch-Artifact 'vsix' "$Ext.vsix" $null $vsix) {
-            $rc = Invoke-LoggedCommand -Label "ext install $Ext (vsix)" -Command 'code' `
-                -ArgumentList @('--install-extension',$vsix)
+            $rc = Invoke-StreamedCommand -Label "ext install $Ext (vsix)" -Command 'code' `
+                -ArgumentList @('--install-extension',$vsix) `
+                -StatusPrefix "   $Ext" -LineFilter { param($l) Format-ExtensionLine $l }
             if ($rc -eq 0) { Write-Status OK "ext $Ext"; return $true }
         }
     }
-    $rc = Invoke-LoggedCommand -Label "ext install $Ext (marketplace)" -Command 'code' `
-        -ArgumentList @('--install-extension',$Ext)
+    $rc = Invoke-StreamedCommand -Label "ext install $Ext (marketplace)" -Command 'code' `
+        -ArgumentList @('--install-extension',$Ext) `
+        -StatusPrefix "   $Ext" -LineFilter { param($l) Format-ExtensionLine $l }
     if ($rc -eq 0) { Write-Status OK "ext $Ext"; return $true }
     return $false
+}
+
+function Format-ExtensionLine {
+    param([string]$Line)
+    if (-not $Line) { return $null }
+    if ($Line -match 'Installing extensions') { return 'installing' }
+    if ($Line -match 'Installing extension') { return 'installing' }
+    if ($Line -match 'was successfully installed') { return 'installed' }
+    if ($Line -match 'is already installed') { return 'already installed' }
+    if ($Line -match 'Downloading') { return 'downloading' }
+    if ($Line -match 'Verifying') { return 'verifying' }
+    return $null
+}
+
+# Run pio pkg install AND code --install-extension calls in parallel: PIO as a
+# single long process, extensions as a serialised chain (the code CLI doesn't
+# parallelise safely). Both share one render loop that prints a single status
+# line with both streams' progress.
+#
+# All loop state lives in a single hashtable ($S) so the inline "start next ext"
+# block can mutate it without scope contortions.
+function Invoke-ParallelLibsAndExtensions {
+    if (-not (Test-Path (Join-Path $Script:Workspace 'platformio.ini'))) {
+        Write-Status FAIL 'platformio.ini missing'
+        Ensure-Extensions
+        return
+    }
+    if (-not (Test-Path $Script:PioBin)) {
+        # Earlier phase recorded FAIL on PlatformIO; don't crash here.
+        Write-Status FAIL 'PlatformIO missing — skipping library install'
+        Ensure-Extensions
+        return
+    }
+    if (-not (Get-Command code -ErrorAction SilentlyContinue)) {
+        # Without code on PATH we can't parallelise; fall back to sequential.
+        Ensure-Libraries; Ensure-Extensions; return
+    }
+
+    $S = @{
+        LibTotal   = $Script:ExpectedLibs.Count
+        LibDone    = 0
+        LibOut     = (New-TemporaryFile)
+        LibErr     = (New-TemporaryFile)
+        LibOutPos  = 0
+        LibErrPos  = 0
+        LibStatus  = 'starting'
+
+        ExtTotal   = $Script:VscodeExts.Count
+        ExtQueue   = [System.Collections.Queue]::new()
+        ExtIdx     = 0
+        ExtCur     = $null
+        ExtProc    = $null
+        ExtOut     = $null
+        ExtErr     = $null
+        ExtOutPos  = 0
+        ExtErrPos  = 0
+        ExtStatus  = 'queued'
+        ExtResults = @{}
+        ExtInstalled = @{}
+    }
+    foreach ($e in $Script:VscodeExts) { $S.ExtQueue.Enqueue($e) }
+    (& code --list-extensions 2>$null) | ForEach-Object {
+        if ($_) { $S.ExtInstalled[$_.ToLower()] = $true }
+    }
+
+    Write-Status INSTALL "Installing $($S.LibTotal) libraries + $($S.ExtTotal) VS Code extensions in parallel"
+
+    Write-Log "+ pio pkg install (parallel)"
+    $libProc = $null
+    try {
+        $libProc = Start-Process -FilePath $Script:PioBin -ArgumentList @('pkg','install') `
+            -WorkingDirectory $Script:Workspace -NoNewWindow -PassThru `
+            -RedirectStandardOutput $S.LibOut.FullName -RedirectStandardError $S.LibErr.FullName
+    } catch {
+        Write-Log "pio launch failed: $_"
+        Write-Status FAIL "pio pkg install could not launch: $($_.Exception.Message)"
+        Remove-Item $S.LibOut.FullName, $S.LibErr.FullName -ErrorAction SilentlyContinue
+        # Fall back to sequential extension install so we still finish the phase.
+        Ensure-Extensions
+        return
+    }
+
+    $startNextExt = {
+        if ($S.ExtQueue.Count -eq 0) { return }
+        $S.ExtCur = $S.ExtQueue.Dequeue()
+        $S.ExtIdx = $S.ExtIdx + 1
+        if ($S.ExtInstalled.ContainsKey($S.ExtCur.ToLower())) {
+            $S.ExtResults[$S.ExtCur] = 'skip'
+            $S.ExtStatus = ("[{0}/{1}] {2} (cached)" -f $S.ExtIdx, $S.ExtTotal, $S.ExtCur)
+            $S.ExtProc = $null
+            return
+        }
+        $S.ExtOut = New-TemporaryFile; $S.ExtErr = New-TemporaryFile
+        $S.ExtOutPos = 0; $S.ExtErrPos = 0
+        $S.ExtStatus = ("[{0}/{1}] {2}" -f $S.ExtIdx, $S.ExtTotal, $S.ExtCur)
+        Write-Log "+ ext install $($S.ExtCur) (parallel)"
+        try {
+            $S.ExtProc = Start-Process -FilePath 'code' `
+                -ArgumentList @('--install-extension', $S.ExtCur) `
+                -NoNewWindow -PassThru `
+                -RedirectStandardOutput $S.ExtOut.FullName `
+                -RedirectStandardError  $S.ExtErr.FullName
+        } catch {
+            Write-Log "code launch failed for $($S.ExtCur): $_"
+            $S.ExtResults[$S.ExtCur] = 'fail'
+            $S.ExtStatus = ("[{0}/{1}] {2} (launch failed)" -f $S.ExtIdx, $S.ExtTotal, $S.ExtCur)
+            Remove-Item $S.ExtOut.FullName, $S.ExtErr.FullName -ErrorAction SilentlyContinue
+            $S.ExtProc = $null
+        }
+    }
+
+    & $startNextExt
+
+    $libLineFilter = {
+        param($line)
+        if ($line -match 'Library Manager:\s+Installing\s+(.+)$') {
+            $S.LibDone = [Math]::Min($S.LibDone + 1, $S.LibTotal)
+            return ("[{0}/{1}] {2}" -f $S.LibDone, $S.LibTotal, $matches[1].Trim())
+        }
+        if ($line -match 'Library Manager:\s+(.+?)\s+@\s+\S+\s+is already installed') {
+            $S.LibDone = [Math]::Min($S.LibDone + 1, $S.LibTotal)
+            return ("[{0}/{1}] {2} (cached)" -f $S.LibDone, $S.LibTotal, $matches[1].Trim())
+        }
+        return $null
+    }
+    $extLineFilter = {
+        param($line)
+        $f = Format-ExtensionLine $line
+        if ($f) { return ("[{0}/{1}] {2} · {3}" -f $S.ExtIdx, $S.ExtTotal, $S.ExtCur, $f) }
+        return $null
+    }
+
+    $tick = 0
+    while ($true) {
+        # Lib polling.
+        $S.LibStatus = Read-StreamProgress -OutPath $S.LibOut.FullName -ErrPath $S.LibErr.FullName `
+            -OutPosRef ([ref]$S.LibOutPos) -ErrPosRef ([ref]$S.LibErrPos) `
+            -LastStatus $S.LibStatus -LineFilter $libLineFilter
+
+        # Ext polling (only when a real process is running).
+        if ($S.ExtProc -and -not $S.ExtProc.HasExited) {
+            $S.ExtStatus = Read-StreamProgress -OutPath $S.ExtOut.FullName -ErrPath $S.ExtErr.FullName `
+                -OutPosRef ([ref]$S.ExtOutPos) -ErrPosRef ([ref]$S.ExtErrPos) `
+                -LastStatus $S.ExtStatus -LineFilter $extLineFilter
+        }
+
+        # Current ext finished (or was a cached skip) — advance.
+        $extReady = (-not $S.ExtProc) -or $S.ExtProc.HasExited
+        if ($extReady -and $S.ExtCur) {
+            if ($S.ExtProc) {
+                $null = Read-StreamProgress -OutPath $S.ExtOut.FullName -ErrPath $S.ExtErr.FullName `
+                    -OutPosRef ([ref]$S.ExtOutPos) -ErrPosRef ([ref]$S.ExtErrPos) `
+                    -LastStatus $S.ExtStatus -LineFilter $extLineFilter
+                $S.ExtResults[$S.ExtCur] = if ($S.ExtProc.ExitCode -eq 0) { 'ok' } else { 'fail' }
+                Remove-Item $S.ExtOut.FullName, $S.ExtErr.FullName -ErrorAction SilentlyContinue
+            }
+            $S.ExtCur = $null; $S.ExtProc = $null
+            & $startNextExt
+        }
+
+        # Render: single line, both tracks.
+        $frame = Get-SpinFrame -Tick $tick
+        $line = "  {0} Libs: {1}  │  Exts: {2}" -f $frame, $S.LibStatus, $S.ExtStatus
+        if ($line.Length -gt ($Script:ProgressClearWidth - 2)) {
+            $line = $line.Substring(0, $Script:ProgressClearWidth - 5) + '...'
+        }
+        Write-Host ("`r" + $line.PadRight($Script:ProgressClearWidth)) -NoNewline
+
+        $libIsDone = $libProc.HasExited
+        $extIsDone = ($S.ExtQueue.Count -eq 0) -and (-not $S.ExtCur) -and (-not $S.ExtProc)
+        if ($libIsDone -and $extIsDone) { break }
+        Start-Sleep -Milliseconds 120
+        $tick++
+    }
+    # Final drain.
+    $null = Read-StreamProgress -OutPath $S.LibOut.FullName -ErrPath $S.LibErr.FullName `
+        -OutPosRef ([ref]$S.LibOutPos) -ErrPosRef ([ref]$S.LibErrPos) -LastStatus $S.LibStatus
+    Clear-ProgressLine
+
+    $libRc = $libProc.ExitCode
+    Remove-Item $S.LibOut.FullName, $S.LibErr.FullName -ErrorAction SilentlyContinue
+    Write-Log "= pio pkg install (parallel) rc=$libRc"
+
+    # Report library results.
+    if ($libRc -ne 0) {
+        Write-Status FAIL 'pio pkg install failed'
+    } else {
+        $libdeps = Join-Path $Script:Workspace '.pio\libdeps'
+        if (-not (Test-Path $libdeps)) {
+            Write-Status FAIL 'libdeps directory missing'
+        } else {
+            $missing = 0
+            foreach ($lib in $Script:ExpectedLibs) {
+                $pat = ($lib -split ' ')[0]
+                $found = Get-ChildItem -Path $libdeps -Directory -Recurse -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -like "*$pat*" }
+                if (-not $found) { Write-Status FAIL "Library missing: $lib"; $missing++ }
+            }
+            if ($missing -eq 0) { Write-Status OK "All $($S.LibTotal) libraries installed" }
+        }
+    }
+
+    # Report extension results (with sequential fallback on failure).
+    foreach ($ext in $Script:VscodeExts) {
+        $r = $S.ExtResults[$ext]
+        switch ($r) {
+            'ok'   { Write-Status OK   "ext $ext" }
+            'skip' { Write-Status SKIP "ext $ext (already installed)" }
+            'fail' {
+                Write-Status WARN "ext $ext failed in parallel run — retrying"
+                if (-not (Install-OneExtension $ext)) { Write-Status FAIL "ext $ext could not be installed" }
+            }
+            default { Write-Status FAIL "ext ${ext}: no result (queue error)" }
+        }
+    }
 }
 
 # =============================================================================
@@ -1395,17 +1808,103 @@ function Configure-VsCodeUserSettings {
     $obj = if (Test-Path $f) {
         try { Get-Content $f -Raw | ConvertFrom-Json } catch { [pscustomobject]@{} }
     } else { [pscustomobject]@{} }
-    # Suppress distracting popups, panels, and prompts on first open
-    $obj | Add-Member -NotePropertyName 'security.workspace.trust.enabled'               -NotePropertyValue $false -Force
-    $obj | Add-Member -NotePropertyName 'platformio-ide.customPATH'                      -NotePropertyValue (Join-Path $Script:VenvDir 'Scripts') -Force
-    $obj | Add-Member -NotePropertyName 'workbench.secondarySideBar.visible'             -NotePropertyValue $false -Force
-    $obj | Add-Member -NotePropertyName 'workbench.startupEditor'                        -NotePropertyValue 'none' -Force
-    $obj | Add-Member -NotePropertyName 'workbench.welcomePage.walkthroughs.openOnInstall' -NotePropertyValue $false -Force
-    $obj | Add-Member -NotePropertyName 'workbench.tips.enabled'                         -NotePropertyValue $false -Force
-    $obj | Add-Member -NotePropertyName 'chat.commandCenter.enabled'                     -NotePropertyValue $false -Force
-    $obj | Add-Member -NotePropertyName 'update.showReleaseNotes'                        -NotePropertyValue $false -Force
-    $obj | Add-Member -NotePropertyName 'extensions.ignoreRecommendations'               -NotePropertyValue $true  -Force
+
+    # User-level keys are kept narrow on purpose: only things that MUST take
+    # effect before any workspace has loaded (trust dialog, chat panel that
+    # autostarts globally, PIO Home auto-popup on extension activation,
+    # startup walkthrough). Editor / window restoration is workspace-scoped
+    # and lives in setup/.vscode/settings.json instead — touching them here
+    # would change behavior for unrelated VS Code workspaces on the student's
+    # machine.
+    $keys = @{
+        # Trust / startup chrome.
+        'security.workspace.trust.enabled'                = $false
+        'workbench.startupEditor'                         = 'none'
+        'workbench.welcomePage.walkthroughs.openOnInstall'= $false
+        'workbench.tips.enabled'                          = $false
+        'update.showReleaseNotes'                         = $false
+        'extensions.ignoreRecommendations'                = $true
+
+        # Chat / auxiliary side bar — the built-in Chat extension auto-shows
+        # its view regardless of which workspace is open, so suppression must
+        # be user-level.
+        'workbench.secondarySideBar.visible'              = $false
+        'workbench.auxiliaryBar.visible'                  = $false
+        'chat.commandCenter.enabled'                      = $false
+        'chat.editor.enabled'                             = $false
+        'chat.experimental.offerSetup'                    = $false
+        'chat.setupFromDialog'                            = $false
+        'chat.welcomeView.enabled'                        = $false
+
+        # PlatformIO — PIO Home pops up on first activation before workspace
+        # settings load, so user-level is the only reliable place to disable it.
+        'platformio-ide.customPATH'                       = (Join-Path $Script:VenvDir 'Scripts')
+        'platformio-ide.disablePIOHomeStartup'            = $true
+        'platformio-ide.activateOnlyOnPlatformIOProject'  = $true
+        'platformio-ide.autoOpenPlatformIOIniFile'        = $false
+        'platformio-ide.useBuiltinPIOCore'                = $false
+    }
+    foreach ($k in $keys.Keys) {
+        $obj | Add-Member -NotePropertyName $k -NotePropertyValue $keys[$k] -Force
+    }
     [System.IO.File]::WriteAllText($f, ($obj | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
+}
+
+# Returns the workspace-storage folder VS Code uses for our workspace, or $null.
+# VS Code hashes the workspace URI (file:///C:/Users/.../YSP_TDCS_Makerspace) with
+# MD5 and stores per-workspace layout state (including auxiliary-bar visibility)
+# under %APPDATA%/Code/User/workspaceStorage/<hash>/.
+function Get-VsCodeWorkspaceStorageDir {
+    $base = Join-Path $env:APPDATA 'Code\User\workspaceStorage'
+    if (-not (Test-Path $base)) { return $null }
+    # Build the file URI VS Code uses (forward slashes, lower-case drive letter).
+    $abs = (Resolve-Path $Script:Workspace -ErrorAction SilentlyContinue).Path
+    if (-not $abs) { return $null }
+    $uri = 'file:///' + ($abs -replace '\\','/')
+    if ($uri -match '^(file:///)([A-Za-z]):') {
+        $uri = "$($matches[1])$($matches[2].ToLower()):" + $uri.Substring($matches[0].Length)
+    }
+    $md5 = [System.Security.Cryptography.MD5]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($uri)
+        $hash  = ($md5.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join ''
+    } finally { $md5.Dispose() }
+    $dir = Join-Path $base $hash
+    if (Test-Path $dir) { return $dir }
+    return $null
+}
+
+# Clear the prior auxiliary-bar visibility so the chat panel does not reappear
+# when VS Code restores layout state. Best-effort: success when the dir is gone
+# or when the layout state file is missing.
+function Reset-VsCodeAuxBarState {
+    $dir = Get-VsCodeWorkspaceStorageDir
+    if (-not $dir) { return }
+    # The auxiliary bar visibility lives inside state.vscdb (SQLite); we don't
+    # ship sqlite3 on Windows. Removing the whole workspace-storage dir is safe:
+    # VS Code rebuilds it on next launch with the values from user/workspace
+    # settings, which now insist on a hidden aux bar.
+    try {
+        Remove-Item -Path $dir -Recurse -Force -ErrorAction Stop
+        Write-Log "Reset VS Code workspace state: $dir"
+    } catch {
+        Write-Log "Could not reset VS Code workspace state: $_"
+    }
+}
+
+# Probe whether the installed code CLI accepts a given flag, by running
+# `code --help` once and grepping. Cached per-flag for the session.
+$Script:CodeFlagCache = @{}
+function Test-CodeFlagSupported {
+    param([Parameter(Mandatory)][string]$Flag)
+    if ($Script:CodeFlagCache.ContainsKey($Flag)) { return $Script:CodeFlagCache[$Flag] }
+    $supported = $false
+    try {
+        $help = (& code --help 2>$null) -join "`n"
+        $supported = $help -match [regex]::Escape($Flag)
+    } catch { $supported = $false }
+    $Script:CodeFlagCache[$Flag] = $supported
+    return $supported
 }
 
 function Open-VsCode-IfSafe {
@@ -1423,12 +1922,21 @@ function Open-VsCode-IfSafe {
     }
 
     Configure-VsCodeUserSettings
+    # Clean per-workspace layout state ONLY on first_run so the chat aux bar
+    # does not restore from a previous launch. On daily/repair runs we trust
+    # the user-level settings to keep chat hidden; nuking the storage every
+    # run would also erase editor tabs, breakpoints, and search history.
+    if ($Script:Mode -eq 'first_run') { Reset-VsCodeAuxBarState }
 
     # Open as single-root folder so PIO workspaceContains:platformio.ini activates.
     # Use cmd /c so code.cmd doesn't block the PowerShell process.
     $codeArgs = @($Script:Workspace)
     $codeFile = Join-Path $Script:StudentCodeDir 'main.cpp'
     if (Test-Path $codeFile) { $codeArgs += $codeFile }
+    # Newer VS Code (1.94+) supports --disable-chat-setup; older ones silently error.
+    if (Test-CodeFlagSupported '--disable-chat-setup') {
+        $codeArgs = @('--disable-chat-setup') + $codeArgs
+    }
     try {
         $quotedArgs = ($codeArgs | ForEach-Object { '"' + ($_ -replace '"','\"') + '"' }) -join ' '
         Start-Process -FilePath 'cmd.exe' -ArgumentList "/c code $quotedArgs" -WindowStyle Hidden
@@ -1486,27 +1994,111 @@ function Invoke-Main {
 
     switch ($Script:Mode) {
         'first_run' {
-            Write-Status INFO 'First run — installing everything (10-15 minutes)'
+            Show-FirstRunPlan
+            # Gate dependent phases on critical-prerequisite outcomes. When a
+            # foundation step fails, downstream phases would only multiply the
+            # error count without giving the student new information; we stop
+            # and let the final summary show one actionable failure.
+            Write-Phase 'Preflight' -Step 1 -Total 7
             Discover-Mirror
-            Ensure-Uv; Ensure-Python; Ensure-Upstream; Sync-Workspace
+
+            Write-Phase 'Python toolchain' -Step 2 -Total 7
+            Ensure-Uv
+            if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+                Write-Status FAIL 'uv missing — halting install (rest of phases would only echo this)'
+                Stop-Phase
+                Write-FinalSummary
+                Open-VsCode-IfSafe
+                return
+            }
+            Ensure-Python
+
+            Write-Phase 'Workspace' -Step 3 -Total 7
+            Ensure-Upstream; Sync-Workspace
             Disable-GitInWorkspace; Seed-StudentCodeIfEmpty
             Ensure-Venv; Ensure-PlatformIO; Ensure-PioOnPath
-            Ensure-Esp32Platform; Ensure-Libraries; Ensure-VsCode; Ensure-Extensions
-            Run-SmokeTest | Out-Null
+            $pioReady = Test-Path $Script:PioBin
+            if (-not $pioReady) {
+                Write-Status FAIL 'PlatformIO missing — skipping ESP32 platform, libraries, and smoke test'
+            }
+
+            Write-Phase 'ESP32 platform (~500 MB)' -Step 4 -Total 7
+            if ($pioReady) { Ensure-Esp32Platform } else { Write-Status SKIP 'ESP32 platform (PIO unavailable)' }
+            $esp32Ready = $pioReady -and (
+                (Test-Path (Join-Path $Script:Workspace '.pio-core\packages')) -and
+                @(Get-ChildItem (Join-Path $Script:Workspace '.pio-core\packages') `
+                    -Directory -Filter 'toolchain-xtensa*' -ErrorAction SilentlyContinue).Count -gt 0
+            )
+
+            Write-Phase 'VS Code' -Step 5 -Total 7
+            Ensure-VsCode
+
+            Write-Phase 'Libraries + extensions (parallel)' -Step 6 -Total 7
+            if ($pioReady) {
+                Invoke-ParallelLibsAndExtensions
+            } else {
+                # Skip libs (PIO unavailable) but still install extensions so
+                # the student at least gets the editor + PIO toolbar wired up.
+                Write-Status SKIP 'Libraries (PIO unavailable)'
+                Ensure-Extensions
+            }
+
+            Write-Phase 'Smoke test' -Step 7 -Total 7
+            if ($pioReady -and $esp32Ready) {
+                Run-SmokeTest | Out-Null
+            } else {
+                Write-Status SKIP 'Smoke test (PIO/ESP32 toolchain unavailable)'
+            }
+            Stop-Phase
         }
         'repair' {
-            Write-Status INFO 'Repairing environment'
+            Write-Phase 'Repair'
             Ensure-Upstream; Sync-Workspace
             Invoke-AllHealthChecks | Out-Null
+            Stop-Phase
         }
         'daily' {
+            Write-Phase 'Daily sync'
             Ensure-Upstream; Sync-Workspace; Seed-StudentCodeIfEmpty
             Print-PortGuidance
+            Stop-Phase
         }
     }
 
     Write-FinalSummary
     Open-VsCode-IfSafe
+}
+
+function Show-FirstRunPlan {
+    Write-Host ''
+    if ($Script:UseColor) {
+        Write-Host '  First-time setup — here is what will happen:' -ForegroundColor White
+        Write-Host '  (about 10-15 minutes on a fast network)' -ForegroundColor DarkGray
+    } else {
+        Write-Host '  First-time setup — here is what will happen:'
+        Write-Host '  (about 10-15 minutes on a fast network)'
+    }
+    $steps = @(
+        @('1','Preflight',              '~10s',   'check internet, disk, clock'),
+        @('2','Python toolchain',       '1-2 min','install uv + Python 3.11'),
+        @('3','Workspace',              '30-60s', 'clone class content, create .venv, install PlatformIO'),
+        @('4','ESP32 platform',         '3-5 min','download 500 MB toolchain'),
+        @('5','VS Code',                '1-2 min','install VS Code (if missing)'),
+        @('6','Libraries + extensions', '1-2 min','parallel: 6 Arduino libs + 3 VS Code extensions'),
+        @('7','Smoke test',             '30s',    'verify the toolchain compiles a tiny sketch')
+    )
+    foreach ($s in $steps) {
+        if ($Script:UseColor) {
+            Write-Host ('    ') -NoNewline
+            Write-Host ($s[0] + '.') -ForegroundColor Magenta -NoNewline
+            Write-Host (' {0,-26}' -f $s[1]) -ForegroundColor White -NoNewline
+            Write-Host ('{0,-10}' -f $s[2]) -ForegroundColor Yellow -NoNewline
+            Write-Host $s[3] -ForegroundColor DarkGray
+        } else {
+            Write-Host ('    {0}. {1,-26} {2,-10} {3}' -f $s[0],$s[1],$s[2],$s[3])
+        }
+    }
+    Write-Host ''
 }
 
 # TDCS_TEST_NO_MAIN suppresses Invoke-Main so Pester can dot-source this file.
