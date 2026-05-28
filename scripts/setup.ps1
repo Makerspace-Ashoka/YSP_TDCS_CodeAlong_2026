@@ -1187,22 +1187,26 @@ function Ensure-VsCode {
         }
         Write-Status WARN "VS Code $ver below minimum; reinstalling"
     }
-    Write-Status INSTALL 'Installing VS Code via winget...'
-    $rc = Invoke-LoggedCommand -Label 'winget install vscode' -Command 'winget' `
+    Write-Status INSTALL 'Installing VS Code via winget'
+    $rc = Invoke-StreamedCommand -Label 'winget install vscode' -Command 'winget' `
         -ArgumentList @('install', '--id', 'Microsoft.VisualStudioCode', '--silent',
                         '--accept-package-agreements', '--accept-source-agreements',
-                        '--disable-interactivity')
+                        '--disable-interactivity') `
+        -StatusPrefix '   vscode' -LineFilter { param($l) Format-WingetLine $l }
     if ($rc -ne 0) {
         Write-Status WARN "winget failed (rc=$rc) — falling back to direct download"
         $installer = Join-Path $Script:StateDir 'VSCodeSetup.exe'
         $internet  = 'https://code.visualstudio.com/sha/download?build=stable&os=win32-x64-user'
-        Write-Status INSTALL 'Downloading VS Code installer...'
+        Write-Status INSTALL 'Downloading VS Code installer'
         if (-not (Fetch-Artifact 'vscode' 'VSCodeSetup-x64.exe' $internet $installer)) {
             Write-Status FAIL 'VS Code download failed'; return
         }
         $installArgs = @('/VERYSILENT', '/NORESTART',
                          '/MERGETASKS=!desktopicon,!quicklaunchicon,!associatewithfiles,!addcontextmenufiles,!addcontextmenufolders,addtopath')
-        $rc = Invoke-LoggedCommand -Label 'vscode install' -Command $installer -ArgumentList $installArgs
+        Write-Status INSTALL 'Running VS Code installer'
+        $rc = Invoke-StreamedCommand -Label 'vscode install' -Command $installer `
+            -ArgumentList $installArgs `
+            -StatusPrefix '   installer running (silent)'
         if ($rc -ne 0) { Write-Status FAIL "VS Code installer exited $rc"; return }
     }
     Refresh-Path
@@ -1211,6 +1215,26 @@ function Ensure-VsCode {
     } else {
         Write-Status FAIL 'VS Code not on PATH after install — open a fresh PowerShell window'
     }
+}
+
+# Translate raw winget output lines into short student-facing tags. Winget
+# emits things like:
+#   Found Microsoft Visual Studio Code [XP9KHM4BK9FZ7Q]
+#   Downloading https://...
+#   ██████████████████████████ 87.5 MB / 105 MB
+#   Successfully installed
+function Format-WingetLine {
+    param([string]$Line)
+    if (-not $Line) { return $null }
+    if ($Line -match 'Found\s+(.+?)\s*\[') { return "found $($matches[1].Trim())" }
+    if ($Line -match 'Downloading\s+http') { return 'downloading' }
+    if ($Line -match '(\d+(?:\.\d+)?)\s*MB\s*/\s*(\d+(?:\.\d+)?)\s*MB') {
+        return "downloading $($matches[1]) / $($matches[2]) MB"
+    }
+    if ($Line -match 'Successfully verified')   { return 'verified' }
+    if ($Line -match 'Starting package install'){ return 'installing' }
+    if ($Line -match 'Successfully installed')  { return 'installed' }
+    return $null
 }
 
 function Ensure-Extensions {
